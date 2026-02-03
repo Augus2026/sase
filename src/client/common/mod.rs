@@ -41,7 +41,7 @@ pub struct VpnPacket {
 }
 
 impl VpnPacket {
-    pub const HEADER_SIZE: usize = 14; // 4 + 1 + 4 + 4 + 2 (rounded)
+    pub const HEADER_SIZE: usize = 15; // 4 + 1 + 4 + 4 + 2 = 15
 
     pub fn new(packet_type: PacketType, client_id: u32, sequence: u32, length: u16) -> Self {
         Self {
