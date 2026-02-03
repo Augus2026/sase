@@ -18,12 +18,12 @@ pub fn create_tun_device(config: &ServerConfig) -> Result<AsyncDevice> {
         .netmask(config.tun_netmask)
         .up();
 
-    #[cfg(target_os = "linux")]
-    {
-        tun_config.platform_specific(|config| {
-            // Linux-specific configuration
-        });
-    }
+    // #[cfg(target_os = "linux")]
+    // {
+    //     tun_config.platform_specific(|config| {
+    //         // Linux-specific configuration
+    //     });
+    // }
 
     let tun = tun_config.create_async().context("Failed to create TUN device")?;
 

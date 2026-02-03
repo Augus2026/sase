@@ -97,12 +97,12 @@ fn run_server(config: ServerConfig) -> Result<()> {
         .netmask(config.tun_netmask)
         .up();
 
-    #[cfg(target_os = "linux")]
-    {
-        tun_config.platform_specific(|config| {
-            // Linux-specific configuration
-        });
-    }
+    // #[cfg(target_os = "linux")]
+    // {
+    //     tun_config.platform_specific(|config| {
+    //         // Linux-specific configuration
+    //     });
+    // }
 
     let mut tun = create(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
