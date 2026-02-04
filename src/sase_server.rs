@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -72,155 +73,192 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
     //     });
     // }
 
-    let mut tun = create(&tun_config)?;
+    let tun = create(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
     // Create UDP socket
-    let socket = UdpSocket::bind(&config.bind_addr)?;
+    let socket = Arc::new(UdpSocket::bind(&config.bind_addr)?);
     socket.set_nonblocking(true)?;
     info!("Server listening on {}", socket.local_addr()?);
 
-    // Client registry
-    let mut clients: HashMap<u32, Client> = HashMap::new();
-    let mut next_client_id: u32 = 1;
+    // Client registry - shared between threads
+    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
+    let next_client_id = Arc::new(Mutex::new(1u32));
 
-    let mut tun_buf = vec![0u8; TUN_MTU];
-    let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
+    // Clone for threads
+    let tun_reader_socket = Arc::clone(&socket);
+    let tun_reader_clients = Arc::clone(&clients);
+    let _tun_config = config.clone();
 
-    info!("Server ready, waiting for connections...");
+    let udp_reader_socket = Arc::clone(&socket);
+    let udp_reader_clients = Arc::clone(&clients);
+    let udp_reader_next_client_id = Arc::clone(&next_client_id);
+    let _udp_config = config.clone();
 
-    loop {
-        // Read from TUN and forward to clients
-        match tun.read(&mut tun_buf) {
-            Ok(n) => {
-                info!("Read {} bytes from TUN", n);
+    // Spawn TUN reader thread
+    let tun_handle = thread::spawn(move || {
+        let mut tun = tun;
+        let mut tun_buf = vec![0u8; TUN_MTU];
 
-                if !clients.is_empty() {
-                    let packet_data = &tun_buf[..n];
+        info!("TUN reader thread started");
 
-                    for (_id, client) in clients.iter_mut() {
-                        let packet = VpnPacket::new(
-                            PacketType::Data,
-                            client.client_id,
-                            client.sequence,
-                            n as u16,
-                        );
+        loop {
+            match tun.read(&mut tun_buf) {
+                Ok(n) => {
+                    info!("TUN reader: Read {} bytes from TUN", n);
 
-                        let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + n];
-                        send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
-                        send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(packet_data);
+                    // Get clients snapshot
+                    let clients_map = tun_reader_clients.lock().unwrap();
+                    if !clients_map.is_empty() {
+                        let packet_data = tun_buf[..n].to_vec();
 
-                        if let Err(e) = socket.send_to(&send_buf, client.addr) {
-                            warn!("Failed to send to {}: {}", client.addr, e);
-                        } else {
-                            client.sequence += 1;
+                        for (_id, client) in clients_map.iter() {
+                            let packet = VpnPacket::new(
+                                PacketType::Data,
+                                client.client_id,
+                                client.sequence,
+                                n as u16,
+                            );
+
+                            let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + n];
+                            send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
+                            send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&packet_data);
+
+                            if let Err(e) = tun_reader_socket.send_to(&send_buf, client.addr) {
+                                warn!("TUN reader: Failed to send to {}: {}", client.addr, e);
+                            }
                         }
                     }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available, continue
-            }
-            Err(e) => {
-                error!("Error reading from TUN: {}", e);
-                break;
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    error!("TUN reader: Error reading from TUN: {}", e);
+                    break;
+                }
             }
         }
+    });
 
-        // Read from UDP and handle
-        match socket.recv_from(&mut udp_buf) {
-            Ok((n, src_addr)) => {
-                if n < VpnPacket::HEADER_SIZE {
-                    warn!("Received short packet from {}", src_addr);
-                    continue;
-                }
+    // Spawn UDP reader thread
+    let udp_handle = thread::spawn(move || {
+        let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
 
-                match VpnPacket::from_bytes(&udp_buf[..n]) {
-                    Ok(header) => {
-                        info!(
-                            "Received packet: type={:?}, client_id={}, seq={}, len={} from {}",
-                            header.packet_type, header.client_id, header.sequence,
-                            header.length, src_addr
-                        );
+        info!("UDP reader thread started");
 
-                        match header.packet_type {
-                            PacketType::Handshake => {
-                                // Check if already registered
-                                let is_new = !clients.values().any(|c| c.addr == src_addr);
+        loop {
+            match udp_reader_socket.recv_from(&mut udp_buf) {
+                Ok((n, src_addr)) => {
+                    if n < VpnPacket::HEADER_SIZE {
+                        warn!("UDP reader: Received short packet from {}", src_addr);
+                        continue;
+                    }
 
-                                if is_new {
-                                    let client_id = next_client_id;
-                                    next_client_id = next_client_id.wrapping_add(1);
+                    match VpnPacket::from_bytes(&udp_buf[..n]) {
+                        Ok(header) => {
+                            info!(
+                                "UDP reader: Received type={:?}, client_id={}, seq={}, len={} from {}",
+                                header.packet_type, header.client_id, header.sequence,
+                                header.length, src_addr
+                            );
 
-                                    let client = Client {
-                                        addr: src_addr,
-                                        client_id,
-                                        sequence: 0,
+                            match header.packet_type {
+                                PacketType::Handshake => {
+                                    // Check if already registered
+                                    let is_new = {
+                                        let clients_map = udp_reader_clients.lock().unwrap();
+                                        !clients_map.values().any(|c| c.addr == src_addr)
                                     };
-                                    clients.insert(client_id, client);
-                                    info!("Registered client {} from {}", client_id, src_addr);
 
-                                    // Send handshake response
+                                    if is_new {
+                                        let client_id = {
+                                            let mut next_id = udp_reader_next_client_id.lock().unwrap();
+                                            let id = *next_id;
+                                            *next_id = next_id.wrapping_add(1);
+                                            id
+                                        };
+
+                                        let client = Client {
+                                            addr: src_addr,
+                                            client_id,
+                                            sequence: 0,
+                                        };
+
+                                        {
+                                            let mut clients_map = udp_reader_clients.lock().unwrap();
+                                            clients_map.insert(client_id, client);
+                                        }
+
+                                        info!("UDP reader: Registered client {} from {}", client_id, src_addr);
+
+                                        // Send handshake response
+                                        let response = VpnPacket::new(
+                                            PacketType::Handshake,
+                                            client_id,
+                                            0,
+                                            0,
+                                        );
+                                        let response_buf = response.to_bytes();
+                                        if let Err(e) = udp_reader_socket.send_to(&response_buf, src_addr) {
+                                            error!("UDP reader: Failed to send handshake: {}", e);
+                                        }
+                                    } else {
+                                        info!("UDP reader: Client {} already registered", src_addr);
+                                    }
+                                }
+                                PacketType::Data => {
+                                    info!(
+                                        "UDP reader: Received {} bytes of data from client {}",
+                                        header.length, header.client_id
+                                    );
+                                    // TODO: Write to TUN interface
+                                }
+                                PacketType::KeepAlive => {
+                                    // Respond to keep-alive
                                     let response = VpnPacket::new(
-                                        PacketType::Handshake,
-                                        client_id,
-                                        0,
+                                        PacketType::KeepAlive,
+                                        header.client_id,
+                                        header.sequence,
                                         0,
                                     );
                                     let response_buf = response.to_bytes();
-                                    if let Err(e) = socket.send_to(&response_buf, src_addr) {
-                                        error!("Failed to send handshake: {}", e);
+                                    if let Err(e) = udp_reader_socket.send_to(&response_buf, src_addr) {
+                                        warn!("UDP reader: Failed to send keepalive response: {}", e);
                                     }
-                                } else {
-                                    info!("Client {} already registered", src_addr);
                                 }
-                            }
-                            PacketType::Data => {
-                                info!(
-                                    "Received {} bytes of data from client {}",
-                                    header.length, header.client_id
-                                );
-                                // In a real implementation, write to TUN here
-                            }
-                            PacketType::KeepAlive => {
-                                // Respond to keep-alive
-                                let response = VpnPacket::new(
-                                    PacketType::KeepAlive,
-                                    header.client_id,
-                                    header.sequence,
-                                    0,
-                                );
-                                let response_buf = response.to_bytes();
-                                if let Err(e) = socket.send_to(&response_buf, src_addr) {
-                                    warn!("Failed to send keepalive response: {}", e);
-                                }
-                            }
-                            PacketType::Disconnect => {
-                                if let Some(client) = clients.remove(&header.client_id) {
-                                    info!(
-                                        "Client {} disconnected ({})",
-                                        header.client_id, client.addr
-                                    );
+                                PacketType::Disconnect => {
+                                    let mut clients_map = udp_reader_clients.lock().unwrap();
+                                    if let Some(client) = clients_map.remove(&header.client_id) {
+                                        info!(
+                                            "UDP reader: Client {} disconnected ({})",
+                                            header.client_id, client.addr
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse packet from {}: {}", src_addr, e);
+                        Err(e) => {
+                            warn!("UDP reader: Failed to parse packet from {}: {}", src_addr, e);
+                        }
                     }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available, continue
-            }
-            Err(e) => {
-                error!("Error receiving from UDP: {}", e);
-                break;
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    error!("UDP reader: Error receiving from UDP: {}", e);
+                    break;
+                }
             }
         }
+    });
 
-        thread::sleep(Duration::from_millis(10));
-    }
+    info!("Server ready, waiting for connections...");
+
+    // Wait for threads to complete
+    tun_handle.join().unwrap();
+    udp_handle.join().unwrap();
 
     Ok(())
 }

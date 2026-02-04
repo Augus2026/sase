@@ -3,6 +3,8 @@ use anyhow::Result;
 use log::{error, info, warn};
 use std::io::Read;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -57,25 +59,18 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
         .netmask(config.tun_netmask)
         .up();
 
-    // #[cfg(target_os = "linux")]
-    // {
-    //     tun_config.platform_specific(|config| {
-    //         // Linux-specific configuration
-    //     });
-    // }
-
-    let mut tun = create(&tun_config)?;
+    let tun = create(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
     // Create UDP socket
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
     socket.set_nonblocking(true)?;
     info!("Client bound to {}", socket.local_addr()?);
 
-    // Client state
-    let mut client_id: u32 = 0;
-    let mut sequence: u32 = 0;
-    let mut connected = false;
+    // Shared state
+    let client_id = Arc::new(AtomicU32::new(0));
+    let sequence = Arc::new(AtomicU32::new(0));
+    let connected = Arc::new(AtomicBool::new(false));
 
     // Perform handshake
     info!("Connecting to server at {}", config.server_addr);
@@ -94,12 +89,12 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
     loop {
         match socket.recv_from(&mut resp_buf) {
             Ok((n, addr)) => {
-                if addr.to_string() == config.server_addr.to_string() {
+                if addr == config.server_addr {
                     match VpnPacket::from_bytes(&resp_buf[..n]) {
                         Ok(header) if header.packet_type == PacketType::Handshake => {
                             info!("Connected! Client ID: {}", header.client_id);
-                            client_id = header.client_id;
-                            connected = true;
+                            client_id.store(header.client_id, Ordering::SeqCst);
+                            connected.store(true, Ordering::SeqCst);
                             break;
                         }
                         _ => {
@@ -128,111 +123,147 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
 
     info!("Client ready, tunnel established...");
 
-    let mut tun_buf = vec![0u8; TUN_MTU];
-    let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
-    let mut last_keepalive = std::time::Instant::now();
+    // Clone shared state for threads
+    let tun_reader_socket = Arc::clone(&socket);
+    let tun_reader_client_id = Arc::clone(&client_id);
+    let tun_reader_sequence = Arc::clone(&sequence);
+    let tun_reader_connected = Arc::clone(&connected);
+    let tun_config = config.clone();
 
-    loop {
-        // Read from TUN and forward to server
-        match tun.read(&mut tun_buf) {
-            Ok(n) => {
-                if !connected {
-                    continue;
+    let udp_reader_socket = Arc::clone(&socket);
+    let udp_reader_client_id = Arc::clone(&client_id);
+    let udp_reader_connected = Arc::clone(&connected);
+    let udp_config = config.clone();
+
+    let keepalive_socket = Arc::clone(&socket);
+    let keepalive_client_id = Arc::clone(&client_id);
+    let keepalive_sequence = Arc::clone(&sequence);
+    let keepalive_connected = Arc::clone(&connected);
+    let keepalive_config = config.clone();
+
+    // Spawn TUN reader thread
+    let tun_handle = thread::spawn(move || {
+        let mut tun = tun;
+        let mut tun_buf = vec![0u8; TUN_MTU];
+
+        loop {
+            match tun.read(&mut tun_buf) {
+                Ok(n) if tun_reader_connected.load(Ordering::SeqCst) => {
+                    info!("TUN reader: Read {} bytes from TUN", n);
+
+                    let current_client_id = tun_reader_client_id.load(Ordering::SeqCst);
+                    let current_sequence = tun_reader_sequence.fetch_add(1, Ordering::SeqCst);
+
+                    let packet = VpnPacket::new(PacketType::Data, current_client_id, current_sequence, n as u16);
+
+                    let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + n];
+                    send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
+                    send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&tun_buf[..n]);
+
+                    if let Err(e) = tun_reader_socket.send_to(&send_buf, tun_config.server_addr) {
+                        warn!("TUN reader: Failed to send to server: {}", e);
+                    }
                 }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    error!("TUN reader: Error reading from TUN: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
-                info!("Client: Read {} bytes from TUN", n);
+    // Spawn UDP reader thread
+    let udp_handle = thread::spawn(move || {
+        let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
 
-                let packet = VpnPacket::new(PacketType::Data, client_id, sequence, n as u16);
+        loop {
+            match udp_reader_socket.recv_from(&mut udp_buf) {
+                Ok((n, src_addr)) => {
+                    if src_addr != udp_config.server_addr {
+                        warn!("UDP reader: Received packet from unexpected address: {}", src_addr);
+                        continue;
+                    }
 
-                let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + n];
-                send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
-                send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&tun_buf[..n]);
+                    if n < VpnPacket::HEADER_SIZE {
+                        warn!("UDP reader: Received short packet from {}", src_addr);
+                        continue;
+                    }
 
-                if let Err(e) = socket.send_to(&send_buf, config.server_addr) {
-                    warn!("Failed to send to server: {}", e);
+                    match VpnPacket::from_bytes(&udp_buf[..n]) {
+                        Ok(header) => {
+                            if header.client_id != udp_reader_client_id.load(Ordering::SeqCst) {
+                                warn!("UDP reader: Packet for different client ID");
+                                continue;
+                            }
+
+                            info!(
+                                "UDP reader: Received type={:?}, seq={}, len={}",
+                                header.packet_type, header.sequence, header.length
+                            );
+
+                            match header.packet_type {
+                                PacketType::Data => {
+                                    info!("UDP reader: Received {} bytes of data from server", header.length);
+                                    // TODO: Write to TUN interface
+                                }
+                                PacketType::KeepAlive => {
+                                    info!("UDP reader: Received keepalive from server");
+                                }
+                                PacketType::Disconnect => {
+                                    error!("UDP reader: Server disconnected");
+                                    udp_reader_connected.store(false, Ordering::SeqCst);
+                                    break;
+                                }
+                                _ => {
+                                    info!("UDP reader: Received packet type: {:?}", header.packet_type);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("UDP reader: Failed to parse packet: {}", e);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    error!("UDP reader: Error receiving from UDP: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Keepalive thread
+    let keepalive_handle = thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(10));
+
+            if keepalive_connected.load(Ordering::SeqCst) {
+                let current_client_id = keepalive_client_id.load(Ordering::SeqCst);
+                let current_sequence = keepalive_sequence.load(Ordering::SeqCst);
+
+                let packet = VpnPacket::new(PacketType::KeepAlive, current_client_id, current_sequence, 0);
+                let buf = packet.to_bytes();
+
+                if let Err(e) = keepalive_socket.send_to(&buf, keepalive_config.server_addr) {
+                    warn!("Keepalive: Failed to send keepalive: {}", e);
                 } else {
-                    sequence += 1;
+                    info!("Keepalive: Sent keepalive to server");
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available
-            }
-            Err(e) => {
-                error!("Error reading from TUN: {}", e);
-                break;
             }
         }
+    });
 
-        // Read from UDP and handle
-        match socket.recv_from(&mut udp_buf) {
-            Ok((n, src_addr)) => {
-                if src_addr != config.server_addr {
-                    warn!("Received packet from unexpected address: {}", src_addr);
-                    continue;
-                }
-
-                if n < VpnPacket::HEADER_SIZE {
-                    warn!("Received short packet from {}", src_addr);
-                    continue;
-                }
-
-                match VpnPacket::from_bytes(&udp_buf[..n]) {
-                    Ok(header) => {
-                        if header.client_id != client_id {
-                            warn!("Packet for different client ID");
-                            continue;
-                        }
-
-                        info!(
-                            "Client received: type={:?}, seq={}, len={}",
-                            header.packet_type, header.sequence, header.length
-                        );
-
-                        match header.packet_type {
-                            PacketType::Data => {
-                                info!("Received {} bytes of data from server", header.length);
-                                // In a real implementation, write to TUN here
-                            }
-                            PacketType::KeepAlive => {
-                                info!("Received keepalive from server");
-                            }
-                            PacketType::Disconnect => {
-                                error!("Server disconnected");
-                                break;
-                            }
-                            _ => {
-                                info!("Received packet type: {:?}", header.packet_type);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse packet: {}", e);
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available
-            }
-            Err(e) => {
-                error!("Error receiving from UDP: {}", e);
-                break;
-            }
-        }
-
-        // Send keepalive every 10 seconds
-        if last_keepalive.elapsed() >= Duration::from_secs(10) {
-            let packet = VpnPacket::new(PacketType::KeepAlive, client_id, sequence, 0);
-            let buf = packet.to_bytes();
-            if let Err(e) = socket.send_to(&buf, config.server_addr) {
-                warn!("Failed to send keepalive: {}", e);
-            } else {
-                info!("Sent keepalive to server");
-            }
-            last_keepalive = std::time::Instant::now();
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Wait for threads to complete
+    tun_handle.join().unwrap();
+    udp_handle.join().unwrap();
+    keepalive_handle.join().unwrap();
 
     Ok(())
 }
