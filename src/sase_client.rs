@@ -124,7 +124,10 @@ fn tun_io_thread(
         // Read from TUN and forward to server
         match tun.read(&mut tun_buf) {
             Ok(n) if connected.load(Ordering::SeqCst) => {
-                info!("TUN I/O: Read {} bytes from TUN", n);
+                // Only log on first read or occasionally to reduce spam
+                if sequence.load(Ordering::SeqCst) % 100 == 0 {
+                    info!("TUN I/O: Active - {} bytes to server", n);
+                }
 
                 let current_client_id = client_id.load(Ordering::SeqCst);
                 let current_sequence = sequence.fetch_add(1, Ordering::SeqCst);
@@ -197,15 +200,14 @@ fn udp_reader_thread(
 
                                     if let Err(e) = tun_tx.send(payload) {
                                         error!("UDP reader: Failed to send to TUN writer: {}", e);
-                                    } else {
-                                        info!("UDP reader: Sent {} bytes to TUN", header.length);
                                     }
+                                    // Removed verbose logging
                                 } else {
                                     warn!("UDP reader: Invalid payload length");
                                 }
                             }
                             PacketType::KeepAlive => {
-                                info!("UDP reader: Received keepalive from server");
+                                // Silent keepalive
                             }
                             PacketType::Disconnect => {
                                 error!("UDP reader: Server disconnected");

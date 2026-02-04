@@ -81,7 +81,11 @@ fn tun_io_thread(
         // Read from TUN and broadcast to all clients
         match tun.read(&mut tun_buf) {
             Ok(n) => {
-                info!("TUN I/O: Read {} bytes from TUN", n);
+                // Only log occasionally to reduce spam
+                static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+                    info!("TUN I/O: Active - broadcasting {} bytes", n);
+                }
 
                 let clients_map = clients.lock().unwrap();
                 if !clients_map.is_empty() {
@@ -168,11 +172,6 @@ fn handle_data_packet(
     n: usize,
     tun_tx: &Sender<Vec<u8>>,
 ) {
-    info!(
-        "Received {} bytes of data from client {}",
-        header.length, header.client_id
-    );
-
     let payload_start = VpnPacket::HEADER_SIZE;
     let payload_end = payload_start + header.length as usize;
 
@@ -181,9 +180,8 @@ fn handle_data_packet(
 
         if let Err(e) = tun_tx.send(payload) {
             error!("Failed to send to TUN writer: {}", e);
-        } else {
-            info!("Sent {} bytes to TUN", header.length);
         }
+        // Removed verbose logging
     } else {
         warn!("Invalid payload length");
     }
@@ -210,10 +208,13 @@ fn udp_reader_thread(
 
                 match VpnPacket::from_bytes(&udp_buf[..n]) {
                     Ok(header) => {
-                        info!(
-                            "Received type={:?}, client_id={}, seq={}, len={} from {}",
-                            header.packet_type, header.client_id, header.sequence, header.length, src_addr
-                        );
+                        // Only log important events
+                        if header.packet_type != PacketType::Data {
+                            info!(
+                                "Received type={:?}, client_id={}, seq={}, len={} from {}",
+                                header.packet_type, header.client_id, header.sequence, header.length, src_addr
+                            );
+                        }
 
                         match header.packet_type {
                             PacketType::Handshake => {
