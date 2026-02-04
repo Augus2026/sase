@@ -1,9 +1,10 @@
 use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU};
 use anyhow::Result;
 use log::{error, info, warn};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -123,6 +124,9 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
 
     info!("Client ready, tunnel established...");
 
+    // Create a channel for UDP -> TUN communication
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>();
+
     // Clone shared state for threads
     let tun_reader_socket = Arc::clone(&socket);
     let tun_reader_client_id = Arc::clone(&client_id);
@@ -133,6 +137,7 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
     let udp_reader_socket = Arc::clone(&socket);
     let udp_reader_client_id = Arc::clone(&client_id);
     let udp_reader_connected = Arc::clone(&connected);
+    let udp_tun_tx = tun_tx.clone();
     let udp_config = config.clone();
 
     let keepalive_socket = Arc::clone(&socket);
@@ -147,6 +152,24 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
         let mut tun_buf = vec![0u8; TUN_MTU];
 
         loop {
+            // Check for data to write to TUN
+            match tun_rx.try_recv() {
+                Ok(data) => {
+                    if let Err(e) = tun.write_all(&data) {
+                        warn!("TUN reader: Failed to write to TUN: {}", e);
+                    } else {
+                        info!("TUN reader: Wrote {} bytes to TUN", data.len());
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No data, continue reading
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    error!("TUN reader: Channel disconnected");
+                    break;
+                }
+            }
+
             match tun.read(&mut tun_buf) {
                 Ok(n) if tun_reader_connected.load(Ordering::SeqCst) => {
                     info!("TUN reader: Read {} bytes from TUN", n);
@@ -208,7 +231,23 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
                             match header.packet_type {
                                 PacketType::Data => {
                                     info!("UDP reader: Received {} bytes of data from server", header.length);
-                                    // TODO: Write to TUN interface
+
+                                    // Extract the payload (original IP packet)
+                                    let payload_start = VpnPacket::HEADER_SIZE;
+                                    let payload_end = payload_start + header.length as usize;
+
+                                    if payload_end <= n {
+                                        let payload = udp_buf[payload_start..payload_end].to_vec();
+
+                                        // Send to TUN writer via channel
+                                        if let Err(e) = udp_tun_tx.send(payload) {
+                                            error!("UDP reader: Failed to send to TUN writer: {}", e);
+                                        } else {
+                                            info!("UDP reader: Sent {} bytes to TUN", header.length);
+                                        }
+                                    } else {
+                                        warn!("UDP reader: Invalid payload length");
+                                    }
                                 }
                                 PacketType::KeepAlive => {
                                     info!("UDP reader: Received keepalive from server");
