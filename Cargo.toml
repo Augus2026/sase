@@ -4,12 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "sase_server"
-path = "src/server/main.rs"
-
-[[bin]]
-name = "sase_client"
-path = "src/client/main.rs"
+name = "sase"
+path = "src/main.rs"
 
 [dependencies]
 tun2 = "1.0"

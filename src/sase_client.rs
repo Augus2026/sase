@@ -1,80 +1,48 @@
-mod common;
-
 use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU};
 use anyhow::Result;
-use clap::Parser;
 use log::{error, info, warn};
 use std::io::Read;
 use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
 
-/// SASE VPN Client
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Server address (default: 127.0.0.1:9999)
-    #[arg(short, long)]
+/// Run the client with the specified arguments
+pub fn run_client_with_args(
     server: Option<String>,
-
-    /// TUN device name (default: tun0)
-    #[arg(short, long)]
     tun: Option<String>,
-
-    /// TUN device address (default: 10.0.0.2)
-    #[arg(short, long)]
     address: Option<String>,
-
-    /// Netmask (default: 255.255.255.0)
-    #[arg(short = 'n', long)]
     netmask: Option<String>,
-
-    /// MTU (default: 1500)
-    #[arg(short, long)]
     mtu: Option<usize>,
-
-    /// Verbose logging
-    #[arg(short, long)]
-    verbose: bool,
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        if args.verbose { "debug" } else { "info" },
-    ))
-    .init();
-
+) -> Result<()> {
     let mut config = ClientConfig::default();
 
-    if let Some(server) = args.server {
+    if let Some(server) = server {
         config.server_addr = server.parse()?;
     }
 
-    if let Some(tun) = args.tun {
+    if let Some(tun) = tun {
         config.tun_name = tun;
     }
 
-    if let Some(address) = args.address {
+    if let Some(address) = address {
         config.tun_addr = address.parse()?;
     }
 
-    if let Some(netmask) = args.netmask {
+    if let Some(netmask) = netmask {
         config.tun_netmask = netmask.parse()?;
     }
 
-    if let Some(mtu) = args.mtu {
+    if let Some(mtu) = mtu {
         config.mtu = mtu;
     }
 
-    info!("Starting SASE VPN Client");
     info!("Configuration: {:?}", config);
 
     run_client(config)
 }
 
-fn run_client(config: ClientConfig) -> Result<()> {
+/// Run the client with the given configuration
+pub fn run_client(config: ClientConfig) -> Result<()> {
     use tun2::{create, Configuration};
 
     info!("Creating TUN device: {}", config.tun_name);

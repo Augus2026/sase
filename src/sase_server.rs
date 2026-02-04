@@ -1,8 +1,5 @@
-mod common;
-
 use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU};
 use anyhow::Result;
-use clap::Parser;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::io::Read;
@@ -11,78 +8,49 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
 
-/// SASE VPN Server
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Bind address (default: 0.0.0.0:9999)
-    #[arg(short, long)]
-    bind: Option<String>,
-
-    /// TUN device name (default: tun0)
-    #[arg(short, long)]
-    tun: Option<String>,
-
-    /// TUN device address (default: 10.0.0.1)
-    #[arg(short, long)]
-    address: Option<String>,
-
-    /// Netmask (default: 255.255.255.0)
-    #[arg(short = 'n', long)]
-    netmask: Option<String>,
-
-    /// MTU (default: 1500)
-    #[arg(short, long)]
-    mtu: Option<usize>,
-
-    /// Verbose logging
-    #[arg(short, long)]
-    verbose: bool,
-}
-
 struct Client {
     addr: SocketAddr,
     client_id: u32,
     sequence: u32,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        if args.verbose { "debug" } else { "info" },
-    ))
-    .init();
-
+/// Run the server with the specified arguments
+pub fn run_server_with_args(
+    bind: Option<String>,
+    tun: Option<String>,
+    address: Option<String>,
+    netmask: Option<String>,
+    mtu: Option<usize>,
+) -> Result<()> {
     let mut config = ServerConfig::default();
 
-    if let Some(bind) = args.bind {
+    if let Some(bind) = bind {
         config.bind_addr = bind.parse()?;
     }
 
-    if let Some(tun) = args.tun {
+    if let Some(tun) = tun {
         config.tun_name = tun;
     }
 
-    if let Some(address) = args.address {
+    if let Some(address) = address {
         config.tun_addr = address.parse()?;
     }
 
-    if let Some(netmask) = args.netmask {
+    if let Some(netmask) = netmask {
         config.tun_netmask = netmask.parse()?;
     }
 
-    if let Some(mtu) = args.mtu {
+    if let Some(mtu) = mtu {
         config.mtu = mtu;
     }
 
-    info!("Starting SASE VPN Server");
     info!("Configuration: {:?}", config);
 
     run_server(config)
 }
 
-fn run_server(config: ServerConfig) -> Result<()> {
+/// Run the server with the given configuration
+pub fn run_server(config: ServerConfig) -> Result<()> {
     use tun2::{create, Configuration};
 
     info!("Creating TUN device: {}", config.tun_name);
