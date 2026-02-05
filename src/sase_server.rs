@@ -291,7 +291,8 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
         .netmask(config.tun_netmask)
         .up();
 
-    let tun = create(&tun_config)?;
+    let mut tun = create(&tun_config)?;
+    tun.set_nonblocking(true)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
     let rt = tokio::runtime::Runtime::new()?;
