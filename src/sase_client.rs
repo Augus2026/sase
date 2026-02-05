@@ -27,12 +27,64 @@ fn print_packet_info(prefix: &str, data: &[u8]) {
         _ => "Other",
     };
 
+    // 打印基本信息
     info!("{}: {} {} -> {} ({} bytes)", prefix, proto_name, src_ip, dst_ip, data.len());
 
-    if protocol == 1 && data.len() >= ihl + 8 {
-        let icmp_type = data[ihl];
-        let icmp_code = data[ihl + 1];
-        info!("{}: ICMP type={}, code={}", prefix, icmp_type, icmp_code);
+    // 打印协议详细信息
+    match protocol {
+        1 => {
+            // ICMP
+            if data.len() >= ihl + 8 {
+                let icmp_type = data[ihl];
+                let icmp_code = data[ihl + 1];
+                let checksum = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
+                let id = u16::from_be_bytes([data[ihl + 4], data[ihl + 5]]);
+                let seq = u16::from_be_bytes([data[ihl + 6], data[ihl + 7]]);
+
+                let type_name = match icmp_type {
+                    0 => "Echo Reply",
+                    3 => "Destination Unreachable",
+                    5 => "Redirect",
+                    8 => "Echo Request",
+                    11 => "Time Exceeded",
+                    _ => "Unknown",
+                };
+                info!("  └─ ICMP {} | type={}, code={}, checksum={}, id={}, seq={}",
+                    type_name, icmp_type, icmp_code, checksum, id, seq);
+            }
+        }
+        6 => {
+            // TCP
+            if data.len() >= ihl + 20 {
+                let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
+                let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
+                let seq = u32::from_be_bytes([data[ihl + 4], data[ihl + 5], data[ihl + 6], data[ihl + 7]]);
+                let ack_num = u32::from_be_bytes([data[ihl + 8], data[ihl + 9], data[ihl + 10], data[ihl + 11]]);
+                let flags = data[ihl + 13];
+                let syn = (flags & 0x02) != 0;
+                let ack_flag = (flags & 0x10) != 0;
+                let fin = (flags & 0x01) != 0;
+                let rst = (flags & 0x04) != 0;
+                let psh = (flags & 0x08) != 0;
+                info!("  └─ TCP {} -> {} | SEQ={} ACK={} | flags:{}{}{}{}{}",
+                    src_port, dst_port, seq, ack_num,
+                    if syn { " SYN" } else { "" },
+                    if ack_flag { " ACK" } else { "" },
+                    if fin { " FIN" } else { "" },
+                    if rst { " RST" } else { "" },
+                    if psh { " PSH" } else { "" });
+            }
+        }
+        17 => {
+            // UDP
+            if data.len() >= ihl + 8 {
+                let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
+                let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
+                let length = u16::from_be_bytes([data[ihl + 4], data[ihl + 5]]);
+                info!("  └─ UDP {} -> {} | length={}", src_port, dst_port, length);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -89,13 +141,13 @@ fn tun_reader_thread(
     local_addr: std::net::Ipv4Addr,
 ) {
     let mut tun_buf = vec![0u8; TUN_MTU];
-    let mut sequence = 0u32;
 
     info!("TUN reader thread started");
 
     loop {
         match udp_rx.try_recv() {
             Ok(data) => {
+                print_packet_info("WRITE UDP", &data);
                 if let Err(e) = tun.write_all(&data) {
                     warn!("TUN I/O: Failed to write to TUN: {}", e);
                 }
@@ -112,19 +164,11 @@ fn tun_reader_thread(
                 if n >= 20 {
                     const IP_VERSION: u8 = 0x45;
                     if tun_buf[0] == IP_VERSION {
-                        let src_addr = std::net::Ipv4Addr::new(tun_buf[12], tun_buf[13], tun_buf[14], tun_buf[15]);
-
-                        if src_addr == local_addr {
-                            if sequence % 1000 == 0 {
-                                info!("TUN I/O: Forwarding {} bytes from {} (total: {})", n, src_addr, sequence);
-                            }
-                            sequence += 1;
-
-                            let data = tun_buf[..n].to_vec();
-                            if let Err(e) = tun_tx.blocking_send(data) {
-                                error!("TUN reader: Failed to send to UDP: {}", e);
-                                break;
-                            }
+                        print_packet_info("READ TUN", &tun_buf[..n]);
+                        let data = tun_buf[..n].to_vec();
+                        if let Err(e) = tun_tx.blocking_send(data) {
+                            error!("TUN reader: Failed to send to UDP: {}", e);
+                            break;
                         }
                     }
                 }
@@ -281,13 +325,15 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
             tun_reader_thread(tun, tun_to_udp_tx, udp_to_tun_rx, local_addr);
         });
 
-        let udp_handle = tokio::spawn(udp_io_task(
-            Arc::clone(&socket),
-            config.server_addr,
-            client_id,
-            tun_to_udp_rx,
-            udp_to_tun_tx,
-        ));
+        let udp_handle = tokio::spawn(
+            udp_io_task(
+                Arc::clone(&socket),
+                config.server_addr,
+                client_id,
+                tun_to_udp_rx,
+                udp_to_tun_tx,
+            )
+        );
 
         tokio::signal::ctrl_c().await?;
         info!("Shutting down...");
