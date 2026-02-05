@@ -201,6 +201,7 @@ async fn udp_io_task(
 
                                         if payload_end <= n {
                                             let payload = udp_buf[payload_start..payload_end].to_vec();
+                                            print_packet_info("[udp read]", &payload);
                                             if let Err(e) = tun_tx.send(payload).await {
                                                 error!("Failed to send to TUN writer: {}", e);
                                                 break;
@@ -258,6 +259,7 @@ async fn udp_io_task(
                                 send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
                                 send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
+                                print_packet_info("[udp write]", &send_buf);
                                 if let Err(e) = socket.send_to(&send_buf, client.addr).await {
                                     warn!("Failed to send to {}: {}", client.addr, e);
                                 }
