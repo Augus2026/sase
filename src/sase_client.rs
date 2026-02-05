@@ -1,7 +1,6 @@
 use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU};
 use anyhow::Result;
 use log::{error, info, warn};
-use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -134,51 +133,54 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
     }
 }
 
-fn tun_reader_thread(
-    mut tun: impl Read + Write + 'static,
+async fn tun_io_task(
+    mut tun: tun2::AsyncDevice,
     tun_tx: mpsc::Sender<Vec<u8>>,
     mut udp_rx: mpsc::Receiver<Vec<u8>>,
-    local_addr: std::net::Ipv4Addr,
 ) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let mut tun_buf = vec![0u8; TUN_MTU];
 
-    info!("TUN reader thread started");
+    info!("TUN I/O task started");
 
     loop {
-        match udp_rx.try_recv() {
-            Ok(data) => {
-                print_packet_info("WRITE UDP", &data);
-                if let Err(e) = tun.write_all(&data) {
-                    warn!("TUN I/O: Failed to write to TUN: {}", e);
-                }
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                error!("TUN reader: Channel disconnected");
-                break;
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-
-        match tun.read(&mut tun_buf) {
-            Ok(n) => {
-                if n >= 20 {
-                    const IP_VERSION: u8 = 0x45;
-                    if tun_buf[0] == IP_VERSION {
-                        print_packet_info("READ TUN", &tun_buf[..n]);
-                        let data = tun_buf[..n].to_vec();
-                        if let Err(e) = tun_tx.blocking_send(data) {
-                            error!("TUN reader: Failed to send to UDP: {}", e);
-                            break;
+        tokio::select! {
+            result = udp_rx.recv() => {
+                match result {
+                    Some(data) => {
+                        print_packet_info("WRITE UDP", &data);
+                        if let Err(e) = tun.write_all(&data).await {
+                            warn!("TUN I/O: Failed to write to TUN: {}", e);
                         }
+                    }
+                    None => {
+                        error!("TUN I/O: Channel disconnected");
+                        break;
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => {
-                error!("TUN I/O: Error reading from TUN: {}", e);
-                break;
+
+            result = tun.read(&mut tun_buf) => {
+                match result {
+                    Ok(n) => {
+                        if n >= 20 {
+                            const IP_VERSION: u8 = 0x45;
+                            if tun_buf[0] == IP_VERSION {
+                                print_packet_info("READ TUN", &tun_buf[..n]);
+                                let data = tun_buf[..n].to_vec();
+                                if let Err(e) = tun_tx.send(data).await {
+                                    error!("TUN I/O: Failed to send to UDP: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("TUN I/O: Error reading from TUN: {}", e);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -287,8 +289,8 @@ async fn udp_io_task(
     }
 }
 
-pub fn run_client(config: ClientConfig) -> Result<()> {
-    use tun2::{create, Configuration};
+pub async fn run_client(config: ClientConfig) -> Result<()> {
+    use tun2::{create_as_async, Configuration};
     use std::net::UdpSocket as StdUdpSocket;
 
     info!("Creating TUN device: {}", config.tun_name);
@@ -302,53 +304,46 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
         .netmask(config.tun_netmask)
         .up();
 
-    let mut tun = create(&tun_config)?;
-    tun.set_nonblocking(true)?;
+    let tun = create_as_async(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
-        std_socket.set_nonblocking(true)?;
-        info!("Client bound to {}", std_socket.local_addr()?);
+    let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
+    std_socket.set_nonblocking(true)?;
+    info!("Client bound to {}", std_socket.local_addr()?);
 
-        let socket = UdpSocket::from_std(std_socket)?;
-        let socket = Arc::new(socket);
+    let socket = UdpSocket::from_std(std_socket)?;
+    let socket = Arc::new(socket);
 
-        let client_id = handshake_async(&socket, config.server_addr).await?;
-        info!("Client ready, tunnel established...");
+    let client_id = handshake_async(&socket, config.server_addr).await?;
+    info!("Client ready, tunnel established...");
 
-        let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(1000);
-        let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(1000);
-        let local_addr = config.tun_addr;
+    let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(1000);
 
-        let tun_handle = tokio::task::spawn_blocking(move || {
-            tun_reader_thread(tun, tun_to_udp_tx, udp_to_tun_rx, local_addr);
-        });
+    let tun_handle = tokio::spawn(
+        tun_io_task(tun, tun_to_udp_tx, udp_to_tun_rx)
+    );
 
-        let udp_handle = tokio::spawn(
-            udp_io_task(
-                Arc::clone(&socket),
-                config.server_addr,
-                client_id,
-                tun_to_udp_rx,
-                udp_to_tun_tx,
-            )
-        );
+    let udp_handle = tokio::spawn(
+        udp_io_task(
+            Arc::clone(&socket),
+            config.server_addr,
+            client_id,
+            tun_to_udp_rx,
+            udp_to_tun_tx,
+        )
+    );
 
-        tokio::signal::ctrl_c().await?;
-        info!("Shutting down...");
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down...");
 
-        tun_handle.abort();
-        udp_handle.abort();
-
-        Ok::<(), anyhow::Error>(())
-    })?;
+    tun_handle.abort();
+    udp_handle.abort();
 
     Ok(())
 }
 
-pub fn run_client_with_args(
+pub async fn run_client_with_args(
     server: Option<String>,
     tun: Option<String>,
     address: Option<String>,
@@ -379,5 +374,5 @@ pub fn run_client_with_args(
 
     info!("Configuration: {:?}", config);
 
-    run_client(config)
+    run_client(config).await
 }

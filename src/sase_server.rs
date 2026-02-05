@@ -2,10 +2,8 @@ use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
@@ -93,45 +91,49 @@ struct Client {
     sequence: u32,
 }
 
-fn tun_reader_thread(
-    mut tun: impl Read + Write + 'static,
+async fn tun_io_task(
+    mut tun: tun2::AsyncDevice,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut udp_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let mut tun_buf = vec![0u8; TUN_MTU];
 
-    info!("TUN reader thread started");
+    info!("TUN I/O task started");
 
     loop {
-        match udp_rx.try_recv() {
-            Ok(data) => {
-                print_packet_info("[tun write]", &data);
-                if let Err(e) = tun.write_all(&data) {
-                    warn!("TUN I/O: Failed to write to TUN: {}", e);
+        tokio::select! {
+            result = udp_rx.recv() => {
+                match result {
+                    Some(data) => {
+                        print_packet_info("[tun write]", &data);
+                        if let Err(e) = tun.write_all(&data).await {
+                            warn!("TUN I/O: Failed to write to TUN: {}", e);
+                        }
+                    }
+                    None => {
+                        error!("TUN I/O: Channel disconnected");
+                        break;
+                    }
                 }
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                error!("TUN reader: Channel disconnected");
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-        }
 
-        match tun.read(&mut tun_buf) {
-            Ok(n) => {
-                let data = tun_buf[..n].to_vec();
-                print_packet_info("[tun read]", &data);
-                if let Err(e) = tun_tx.blocking_send(data) {
-                    error!("TUN reader: Failed to send to UDP: {}", e);
-                    break;
+            result = tun.read(&mut tun_buf) => {
+                match result {
+                    Ok(n) => {
+                        let data = tun_buf[..n].to_vec();
+                        print_packet_info("[tun read]", &data);
+                        if let Err(e) = tun_tx.send(data).await {
+                            error!("TUN I/O: Failed to send to UDP: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("TUN I/O: Error reading from TUN: {}", e);
+                        break;
+                    }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => {
-                error!("TUN I/O: Error reading from TUN: {}", e);
-                break;
             }
         }
     }
@@ -276,8 +278,8 @@ async fn udp_io_task(
     }
 }
 
-pub fn run_server(config: ServerConfig) -> Result<()> {
-    use tun2::{create, Configuration};
+pub async fn run_server(config: ServerConfig) -> Result<()> {
+    use tun2::{create_as_async, Configuration};
     use std::net::UdpSocket as StdUdpSocket;
 
     info!("Creating TUN device: {}", config.tun_name);
@@ -291,50 +293,41 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
         .netmask(config.tun_netmask)
         .up();
 
-    let mut tun = create(&tun_config)?;
-    tun.set_nonblocking(true)?;
+    let tun = create_as_async(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
-    let rt = tokio::runtime::Runtime::new()?;
+    let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
+    std_socket.set_nonblocking(true)?;
+    info!("Server listening on {}", std_socket.local_addr()?);
 
-    rt.block_on(async move {
-        let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
-        std_socket.set_nonblocking(true)?;
-        info!("Server listening on {}", std_socket.local_addr()?);
+    let socket = UdpSocket::from_std(std_socket)?;
+    let socket = Arc::new(socket);
 
-        let socket = UdpSocket::from_std(std_socket)?;
-        let socket = Arc::new(socket);
+    let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
+    let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
 
-        let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
-        let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
+    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
+    let tun_handle = tokio::spawn(tun_io_task(tun, tun_to_udp_tx, udp_to_tun_rx));
 
-        let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
-        let tun_handle = tokio::task::spawn_blocking(move || {
-            tun_reader_thread(tun, tun_to_udp_tx, udp_to_tun_rx);
-        });
+    let udp_handle = tokio::spawn(udp_io_task(
+        Arc::clone(&socket),
+        Arc::clone(&clients),
+        tun_to_udp_rx,
+        udp_to_tun_tx,
+    ));
 
-        let udp_handle = tokio::spawn(udp_io_task(
-            Arc::clone(&socket),
-            Arc::clone(&clients),
-            tun_to_udp_rx,
-            udp_to_tun_tx,
-        ));
+    info!("Server ready, waiting for connections...");
 
-        info!("Server ready, waiting for connections...");
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down...");
 
-        tokio::signal::ctrl_c().await?;
-        info!("Shutting down...");
-
-        tun_handle.abort();
-        udp_handle.abort();
-
-        Ok::<(), anyhow::Error>(())
-    })?;
+    tun_handle.abort();
+    udp_handle.abort();
 
     Ok(())
 }
 
-pub fn run_server_with_args(
+pub async fn run_server_with_args(
     bind: Option<String>,
     tun: Option<String>,
     address: Option<String>,
@@ -365,5 +358,5 @@ pub fn run_server_with_args(
 
     info!("Configuration: {:?}", config);
 
-    run_server(config)
+    run_server(config).await
 }

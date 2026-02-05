@@ -71,7 +71,8 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -90,7 +91,7 @@ fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Server");
-            sase_server::run_server_with_args(bind, tun, address, netmask, mtu)
+            sase_server::run_server_with_args(bind, tun, address, netmask, mtu).await
         }
         Commands::Client {
             server,
@@ -107,7 +108,7 @@ fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Client");
-            sase_client::run_client_with_args(server, tun, address, netmask, mtu)
+            sase_client::run_client_with_args(server, tun, address, netmask, mtu).await
         }
     }
 }
