@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
-/// Print packet information for debugging
+#[allow(dead_code)]
 fn print_packet_info(prefix: &str, data: &[u8]) {
     if data.len() < 20 {
         info!("{}: Packet too short ({:?} bytes)", prefix, data);
@@ -29,11 +29,6 @@ fn print_packet_info(prefix: &str, data: &[u8]) {
 
     info!("{}: {} {} -> {} ({} bytes)", prefix, proto_name, src_ip, dst_ip, data.len());
 
-    // Print first 32 bytes in hex
-    let hex: String = data.iter().take(32).map(|b| format!("{:02x}", b)).collect();
-    info!("{}: Hex: {}", prefix, hex);
-
-    // Print ICMP details if applicable
     if protocol == 1 && data.len() >= ihl + 8 {
         let icmp_type = data[ihl];
         let icmp_code = data[ihl + 1];
@@ -41,7 +36,6 @@ fn print_packet_info(prefix: &str, data: &[u8]) {
     }
 }
 
-/// Perform handshake with server and return client ID
 async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) -> Result<u32> {
     info!("Connecting to server at {}", server_addr);
 
@@ -51,7 +45,6 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
     socket.send_to(&handshake_buf, server_addr).await?;
     info!("Handshake sent to {}", server_addr);
 
-    // Wait for handshake response
     let timeout = sleep(Duration::from_secs(5));
     tokio::pin!(timeout);
 
@@ -89,8 +82,6 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
     }
 }
 
-
-/// TUN reader task - runs in blocking thread
 fn tun_reader_thread(
     mut tun: impl Read + Write + 'static,
     tun_tx: mpsc::Sender<Vec<u8>>,
@@ -103,10 +94,8 @@ fn tun_reader_thread(
     info!("TUN reader thread started");
 
     loop {
-        // Check for data to write to TUN
         match udp_rx.try_recv() {
             Ok(data) => {
-                print_packet_info("Server->TUN", &data);
                 if let Err(e) = tun.write_all(&data) {
                     warn!("TUN I/O: Failed to write to TUN: {}", e);
                 }
@@ -118,25 +107,19 @@ fn tun_reader_thread(
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
 
-        // Read from TUN
         match tun.read(&mut tun_buf) {
             Ok(n) => {
-                // Parse IP header to check source address
                 if n >= 20 {
                     const IP_VERSION: u8 = 0x45;
                     if tun_buf[0] == IP_VERSION {
                         let src_addr = std::net::Ipv4Addr::new(tun_buf[12], tun_buf[13], tun_buf[14], tun_buf[15]);
 
-                        // Only forward packets from our local address
                         if src_addr == local_addr {
-                            if sequence % 100 == 0 {
-                                info!("TUN I/O: Forwarding {} bytes from {}", n, src_addr);
+                            if sequence % 1000 == 0 {
+                                info!("TUN I/O: Forwarding {} bytes from {} (total: {})", n, src_addr, sequence);
                             }
                             sequence += 1;
 
-                            print_packet_info("TUN->Server", &tun_buf[..n]);
-
-                            // Send to UDP task via blocking_send
                             let data = tun_buf[..n].to_vec();
                             if let Err(e) = tun_tx.blocking_send(data) {
                                 error!("TUN reader: Failed to send to UDP: {}", e);
@@ -147,7 +130,7 @@ fn tun_reader_thread(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(e) => {
                 error!("TUN I/O: Error reading from TUN: {}", e);
@@ -157,7 +140,6 @@ fn tun_reader_thread(
     }
 }
 
-/// UDP I/O task using tokio::select!
 async fn udp_io_task(
     socket: Arc<UdpSocket>,
     server_addr: std::net::SocketAddr,
@@ -173,7 +155,6 @@ async fn udp_io_task(
 
     loop {
         tokio::select! {
-            // Receive data from server
             result = socket.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((n, src_addr)) => {
@@ -226,7 +207,6 @@ async fn udp_io_task(
                 }
             }
 
-            // Send data to server (from TUN)
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
@@ -248,7 +228,6 @@ async fn udp_io_task(
                 }
             }
 
-            // Send keepalive
             _ = keepalive_interval.tick() => {
                 let packet = VpnPacket::new(PacketType::KeepAlive, client_id, sequence, 0);
                 sequence = sequence.wrapping_add(1);
@@ -264,7 +243,6 @@ async fn udp_io_task(
     }
 }
 
-/// Run the client with the given configuration
 pub fn run_client(config: ClientConfig) -> Result<()> {
     use tun2::{create, Configuration};
     use std::net::UdpSocket as StdUdpSocket;
@@ -283,12 +261,8 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
     let tun = create(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
-    // Create async runtime
     let rt = tokio::runtime::Runtime::new()?;
-
-    // Block on async main
     rt.block_on(async move {
-        // Bind UDP socket
         let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
         std_socket.set_nonblocking(true)?;
         info!("Client bound to {}", std_socket.local_addr()?);
@@ -296,22 +270,17 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
         let socket = UdpSocket::from_std(std_socket)?;
         let socket = Arc::new(socket);
 
-        // Perform handshake
         let client_id = handshake_async(&socket, config.server_addr).await?;
         info!("Client ready, tunnel established...");
 
-        // Create channels
-        let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(100);
-        let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(100);
-
+        let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(1000);
+        let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(1000);
         let local_addr = config.tun_addr;
 
-        // Spawn TUN reader in blocking thread
         let tun_handle = tokio::task::spawn_blocking(move || {
             tun_reader_thread(tun, tun_to_udp_tx, udp_to_tun_rx, local_addr);
         });
 
-        // Spawn UDP I/O task
         let udp_handle = tokio::spawn(udp_io_task(
             Arc::clone(&socket),
             config.server_addr,
@@ -320,11 +289,9 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
             udp_to_tun_tx,
         ));
 
-        // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         info!("Shutting down...");
 
-        // Cancel tasks
         tun_handle.abort();
         udp_handle.abort();
 
@@ -334,7 +301,6 @@ pub fn run_client(config: ClientConfig) -> Result<()> {
     Ok(())
 }
 
-/// Run the client with the specified arguments
 pub fn run_client_with_args(
     server: Option<String>,
     tun: Option<String>,
