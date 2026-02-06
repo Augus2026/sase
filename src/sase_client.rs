@@ -195,8 +195,8 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let client_id = handshake_async(&socket, config.server_addr).await?;
     info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);
 
-    let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(1000);
-    let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let tun_handle = tokio::spawn(
         tun_io_task(

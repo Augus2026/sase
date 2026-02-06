@@ -187,8 +187,8 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     let socket = UdpSocket::from_std(socket2_socket.into())?;
     let socket = Arc::new(socket);
 
-    let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
-    let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
+    let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
 
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
     let tun_handle = tokio::spawn(
