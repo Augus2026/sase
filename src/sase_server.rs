@@ -24,7 +24,6 @@ async fn udp_io_task(
 ) {
     let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
     let mut next_client_id = 1u32;
-
     info!("UDP I/O task started");
 
     loop {
