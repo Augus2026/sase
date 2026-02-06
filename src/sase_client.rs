@@ -182,9 +182,14 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 
     let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
     std_socket.set_nonblocking(true)?;
-    debug!("Client bound to {}", std_socket.local_addr()?);
 
-    let socket = UdpSocket::from_std(std_socket)?;
+    let socket2_socket = socket2::Socket::from(std_socket);
+    socket2_socket.set_recv_buffer_size(2 * 1024 * 1024)?;
+    socket2_socket.set_send_buffer_size(2 * 1024 * 1024)?;
+    let local_addr = socket2_socket.local_addr()?.as_socket().expect("Failed to get socket address");
+    info!("Client bound to {} with recv_buffer=2MB, send_buffer=2MB", local_addr);
+
+    let socket = UdpSocket::from_std(socket2_socket.into())?;
     let socket = Arc::new(socket);
 
     let client_id = handshake_async(&socket, config.server_addr).await?;
