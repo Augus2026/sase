@@ -15,15 +15,22 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
     let handshake_packet = VpnPacket::new(PacketType::Handshake, 0, 0, 0);
     let handshake_buf = handshake_packet.to_bytes();
 
-    socket.send_to(&handshake_buf, server_addr).await?;
-    debug!("Handshake sent to {}", server_addr);
-
-    let timeout = sleep(Duration::from_secs(5));
-    tokio::pin!(timeout);
-
-    let mut recv_buf = [0u8; VpnPacket::HEADER_SIZE];
+    let mut retry_delay = Duration::from_secs(1);
+    let max_retry_delay = Duration::from_secs(300);
+    let mut attempt = 0u32;
 
     loop {
+        attempt += 1;
+        info!("Handshake attempt {} to {}", attempt, server_addr);
+
+        socket.send_to(&handshake_buf, server_addr).await?;
+        debug!("Handshake sent to {}", server_addr);
+
+        let timeout = sleep(Duration::from_secs(5));
+        tokio::pin!(timeout);
+
+        let mut recv_buf = [0u8; VpnPacket::HEADER_SIZE];
+
         tokio::select! {
             result = socket.recv_from(&mut recv_buf) => {
                 match result {
@@ -36,22 +43,23 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
                                 }
                                 _ => {
                                     debug!("Unexpected packet during handshake");
-                                    continue;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Error during handshake: {}", e);
-                        return Err(e.into());
+                        debug!("Error during handshake attempt {}: {}", attempt, e);
                     }
                 }
             }
             _ = &mut timeout => {
-                error!("Handshake timeout");
-                anyhow::bail!("Handshake timeout");
+                debug!("Handshake attempt {} timed out", attempt);
             }
         }
+
+        warn!("Connection failed, retrying in {}s...", retry_delay.as_secs());
+        sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
     }
 }
 
