@@ -1,11 +1,13 @@
 use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task};
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
+use tun2::{create_as_async, Configuration};
+use std::net::UdpSocket as StdUdpSocket;
 
 async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) -> Result<u32> {
     info!("Connecting to server at {}", server_addr);
@@ -14,7 +16,7 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
     let handshake_buf = handshake_packet.to_bytes();
 
     socket.send_to(&handshake_buf, server_addr).await?;
-    info!("Handshake sent to {}", server_addr);
+    debug!("Handshake sent to {}", server_addr);
 
     let timeout = sleep(Duration::from_secs(5));
     tokio::pin!(timeout);
@@ -33,7 +35,7 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
                                     return Ok(header.client_id);
                                 }
                                 _ => {
-                                    warn!("Unexpected packet during handshake");
+                                    debug!("Unexpected packet during handshake");
                                     continue;
                                 }
                             }
@@ -64,7 +66,7 @@ async fn udp_io_task(
     let mut keepalive_interval = interval(Duration::from_secs(10));
     let mut sequence = 0u32;
 
-    info!("UDP I/O task started");
+    info!("UDP I/O task started for client {}", client_id);
 
     loop {
         tokio::select! {
@@ -72,12 +74,12 @@ async fn udp_io_task(
                 match result {
                     Ok((n, src_addr)) => {
                         if src_addr != server_addr {
-                            warn!("UDP: Received packet from unexpected address: {}", src_addr);
+                            debug!("UDP: Received packet from unexpected address: {}", src_addr);
                             continue;
                         }
 
                         if n < VpnPacket::HEADER_SIZE {
-                            warn!("UDP: Received short packet");
+                            debug!("UDP: Received short packet");
                             continue;
                         }
 
@@ -100,16 +102,18 @@ async fn udp_io_task(
                                             }
                                         }
                                     }
-                                    PacketType::KeepAlive => {}
+                                    PacketType::KeepAlive => {
+                                        debug!("Keepalive received from server");
+                                    }
                                     PacketType::Disconnect => {
-                                        error!("UDP: Server disconnected");
+                                        warn!("Server disconnected");
                                         break;
                                     }
                                     _ => {}
                                 }
                             }
                             Err(e) => {
-                                warn!("UDP: Failed to parse packet: {}", e);
+                                debug!("UDP: Failed to parse packet: {}", e);
                             }
                         }
                     }
@@ -148,8 +152,6 @@ async fn udp_io_task(
 
                 if let Err(e) = socket.send_to(&buf, server_addr).await {
                     warn!("Keepalive: Failed to send: {}", e);
-                } else {
-                    info!("Keepalive: Sent");
                 }
             }
         }
@@ -157,9 +159,6 @@ async fn udp_io_task(
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
-    use tun2::{create_as_async, Configuration};
-    use std::net::UdpSocket as StdUdpSocket;
-
     info!("Creating TUN device: {}", config.tun_name);
 
     let mut tun_config = Configuration::default();
@@ -176,13 +175,13 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 
     let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
     std_socket.set_nonblocking(true)?;
-    info!("Client bound to {}", std_socket.local_addr()?);
+    debug!("Client bound to {}", std_socket.local_addr()?);
 
     let socket = UdpSocket::from_std(std_socket)?;
     let socket = Arc::new(socket);
 
     let client_id = handshake_async(&socket, config.server_addr).await?;
-    info!("Client ready, tunnel established...");
+    info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);
 
     let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(1000);
     let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(1000);
@@ -203,10 +202,10 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             udp_to_tun_tx,
         )
     );
-    info!("Client {} ready, waiting for connections...", client_id);
+    info!("Client {} is running, press Ctrl+C to stop", client_id);
 
     tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    info!("Shutting down client {}...", client_id);
 
     tun_handle.abort();
     udp_handle.abort();
@@ -243,7 +242,7 @@ pub async fn run_client_with_args(
         config.mtu = mtu;
     }
 
-    info!("Configuration: {:?}", config);
+    debug!("Client configuration: {:?}", config);
 
     run_client(config).await
 }

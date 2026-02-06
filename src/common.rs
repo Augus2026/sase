@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::info;
+use log::{debug, info, warn, error};
 use std::net::{Ipv4Addr, SocketAddr};
 
 /// VPN protocol configuration
@@ -141,7 +141,7 @@ impl Default for ServerConfig {
 #[allow(dead_code)]
 pub fn print_packet_info(prefix: &str, data: &[u8]) {
     if data.len() < 20 {
-        info!("{}: Packet too short ({:?} bytes)", prefix, data);
+        warn!("{}: Packet too short ({:?} bytes)", prefix, data);
         return;
     }
 
@@ -156,7 +156,7 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
         17 => "UDP",
         _ => "Other",
     };
-    info!("{}: {} {} -> {} ({} bytes)", prefix, proto_name, src_ip, dst_ip, data.len());
+    debug!("{}: {} {} -> {} ({} bytes)", prefix, proto_name, src_ip, dst_ip, data.len());
 
     match protocol {
         1 => {
@@ -176,7 +176,7 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
                     11 => "Time Exceeded",
                     _ => "Unknown",
                 };
-                info!("  └─ ICMP {} | type={}, code={}, checksum={}, id={}, seq={}",
+                debug!("  └─ ICMP {} | type={}, code={}, checksum={}, id={}, seq={}",
                     type_name, icmp_type, icmp_code, checksum, id, seq);
             }
         }
@@ -193,7 +193,7 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
                 let fin = (flags & 0x01) != 0;
                 let rst = (flags & 0x04) != 0;
                 let psh = (flags & 0x08) != 0;
-                info!("  └─ TCP {} -> {} | SEQ={} ACK={} | flags:{}{}{}{}{}",
+                debug!("  └─ TCP {} -> {} | SEQ={} ACK={} | flags:{}{}{}{}{}",
                     src_port, dst_port, seq, ack_num,
                     if syn { " SYN" } else { "" },
                     if ack_flag { " ACK" } else { "" },
@@ -208,7 +208,7 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
                 let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
                 let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
                 let length = u16::from_be_bytes([data[ihl + 4], data[ihl + 5]]);
-                info!("  └─ UDP {} -> {} | length={}", src_port, dst_port, length);
+                debug!("  └─ UDP {} -> {} | length={}", src_port, dst_port, length);
             }
         }
         _ => {}
@@ -222,7 +222,6 @@ pub async fn tun_io_task(
     mut udp_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use log::warn;
 
     let mut tun_buf = vec![0u8; TUN_MTU];
 
@@ -235,11 +234,11 @@ pub async fn tun_io_task(
                     Some(data) => {
                         print_packet_info("[tun write]", &data);
                         if let Err(e) = tun.write_all(&data).await {
-                            warn!("TUN I/O: Failed to write to TUN: {}", e);
+                            error!("TUN I/O: Failed to write to TUN: {}", e);
                         }
                     }
                     None => {
-                        log::error!("TUN I/O: Channel disconnected");
+                        error!("TUN I/O: Channel disconnected");
                         break;
                     }
                 }
@@ -251,12 +250,12 @@ pub async fn tun_io_task(
                         let data = tun_buf[..n].to_vec();
                         print_packet_info("[tun read]", &data);
                         if let Err(e) = tun_tx.send(data).await {
-                            log::error!("TUN I/O: Failed to send to UDP: {}", e);
+                            error!("TUN I/O: Failed to send to UDP: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        log::error!("TUN I/O: Error reading from TUN: {}", e);
+                        error!("TUN I/O: Error reading from TUN: {}", e);
                         break;
                     }
                 }

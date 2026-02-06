@@ -1,6 +1,6 @@
 use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task};
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ async fn udp_io_task(
                 match result {
                     Ok((n, src_addr)) => {
                         if n < VpnPacket::HEADER_SIZE {
-                            warn!("UDP: Received short packet from {}", src_addr);
+                            debug!("UDP: Received short packet from {}", src_addr);
                             continue;
                         }
 
@@ -58,7 +58,7 @@ async fn udp_io_task(
                                                 clients_map.insert(next_client_id, client.clone());
                                             }
 
-                                            info!("Registered client {} from {}", next_client_id, src_addr);
+                                            info!("Client {} connected from {}", next_client_id, src_addr);
 
                                             let response = VpnPacket::new(
                                                 PacketType::Handshake,
@@ -68,10 +68,12 @@ async fn udp_io_task(
                                             );
                                             let response_buf = response.to_bytes();
                                             if let Err(e) = socket.send_to(&response_buf, src_addr).await {
-                                                error!("Failed to send handshake: {}", e);
+                                                error!("Failed to send handshake to {}: {}", src_addr, e);
                                             }
 
                                             next_client_id = next_client_id.wrapping_add(1);
+                                        } else {
+                                            debug!("Handshake from existing client {}", src_addr);
                                         }
                                     }
                                     PacketType::Data => {
@@ -86,10 +88,11 @@ async fn udp_io_task(
                                                 break;
                                             }
                                         } else {
-                                            warn!("Invalid payload length");
+                                            warn!("Invalid payload length from client {}", header.client_id);
                                         }
                                     }
                                     PacketType::KeepAlive => {
+                                        debug!("Keepalive received from client {}", header.client_id);
                                         let response = VpnPacket::new(
                                             PacketType::KeepAlive,
                                             header.client_id,
@@ -98,7 +101,7 @@ async fn udp_io_task(
                                         );
                                         let response_buf = response.to_bytes();
                                         if let Err(e) = socket.send_to(&response_buf, src_addr).await {
-                                            warn!("Failed to send keepalive response: {}", e);
+                                            warn!("Failed to send keepalive response to {}: {}", src_addr, e);
                                         }
                                     }
                                     PacketType::Disconnect => {
@@ -110,7 +113,7 @@ async fn udp_io_task(
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to parse packet from {}: {}", src_addr, e);
+                                debug!("Failed to parse packet from {}: {}", src_addr, e);
                             }
                         }
                     }
@@ -125,6 +128,7 @@ async fn udp_io_task(
                 match result {
                     Some(data) => {
                         let clients_map = clients.lock().await;
+                        let client_count = clients_map.len();
                         if !clients_map.is_empty() {
                             for (_id, client) in clients_map.iter() {
                                 let packet = VpnPacket::new(
@@ -143,6 +147,7 @@ async fn udp_io_task(
                                     warn!("Failed to send to {}: {}", client.addr, e);
                                 }
                             }
+                            debug!("Broadcasted data to {} client(s)", client_count);
                         }
                     }
                     None => {
@@ -156,7 +161,7 @@ async fn udp_io_task(
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
-    info!("Creating TUN device: {}", config.tun_name);
+    info!("Starting server with configuration: {}", config.bind_addr);
 
     let mut tun_config = Configuration::default();
     tun_config
@@ -167,6 +172,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         .netmask(config.tun_netmask)
         .up();
 
+    info!("Creating TUN device: {}", config.tun_name);
     let tun = create_as_async(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
@@ -196,10 +202,10 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
             udp_to_tun_tx
         )
     );
-    info!("Server ready, waiting for connections...");
+    info!("Server ready, waiting for client connections...");
 
     tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    info!("Shutting down server...");
 
     tun_handle.abort();
     udp_handle.abort();
@@ -236,7 +242,7 @@ pub async fn run_server_with_args(
         config.mtu = mtu;
     }
 
-    info!("Configuration: {:?}", config);
+    debug!("Server configuration: {:?}", config);
 
     run_server(config).await
 }

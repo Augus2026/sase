@@ -19,7 +19,7 @@ struct Cli {
 enum Commands {
     /// Start the VPN server
     Server {
-        /// Bind address (default: 0.0.0.0:9999)
+        /// Bind address (default: 0.0.0.0:12345)
         #[arg(short, long)]
         bind: Option<String>,
 
@@ -84,7 +84,6 @@ async fn main() -> Result<()> {
             mtu,
             verbose,
         } => {
-            // Initialize logger
             env_logger::Builder::from_env(
                 env_logger::Env::default().default_filter_or(if verbose { "debug" } else { "info" }),
             )
@@ -101,7 +100,6 @@ async fn main() -> Result<()> {
             mtu,
             verbose,
         } => {
-            // Initialize logger
             env_logger::Builder::from_env(
                 env_logger::Env::default().default_filter_or(if verbose { "debug" } else { "info" }),
             )
