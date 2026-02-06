@@ -245,29 +245,11 @@ pub async fn tun_io_task(
             result = tun.read(&mut tun_buf) => {
                 match result {
                     Ok(n) => {
-                        let mut batch = Vec::with_capacity(32);
-                        let first_data = tun_buf[..n].to_vec();
-                        print_packet_info("[tun read] batch start", &first_data);
-                        batch.push(first_data);
-
-                        let batch_timeout = tokio::time::Duration::from_millis(1);
-                        for _ in 0..31 {
-                            match tokio::time::timeout(batch_timeout, tun.read(&mut tun_buf)).await {
-                                Ok(Ok(m)) => {
-                                    let data = tun_buf[..m].to_vec();
-                                    print_packet_info("[tun read] batch continue", &data);
-                                    batch.push(data);
-                                }
-                                _ => break,
-                            }
-                        }
-                        debug!("[tun read] batch complete, total packets: {}", batch.len());
-                        
-                        for data in batch {
-                            if let Err(e) = tun_tx.send(data).await {
-                                error!("TUN I/O: Failed to send to UDP: {}", e);
-                                break;
-                            }
+                        let data = tun_buf[..n].to_vec();
+                        print_packet_info("[tun read]", &data);
+                        if let Err(e) = tun_tx.send(data).await {
+                            error!("TUN I/O: Failed to send to UDP: {}", e);
+                            break;
                         }
                     }
                     Err(e) => {
