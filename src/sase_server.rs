@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+use tun2::{create_as_async, Configuration};
+use std::net::UdpSocket as StdUdpSocket;
 
 #[derive(Clone)]
 struct Client {
@@ -154,9 +156,6 @@ async fn udp_io_task(
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
-    use tun2::{create_as_async, Configuration};
-    use std::net::UdpSocket as StdUdpSocket;
-
     info!("Creating TUN device: {}", config.tun_name);
 
     let mut tun_config = Configuration::default();
@@ -182,15 +181,21 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1000);
 
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_to_udp_tx, udp_to_tun_rx));
-
-    let udp_handle = tokio::spawn(udp_io_task(
-        Arc::clone(&socket),
-        Arc::clone(&clients),
-        tun_to_udp_rx,
-        udp_to_tun_tx,
-    ));
-
+    let tun_handle = tokio::spawn(
+        tun_io_task(
+            tun,
+            tun_to_udp_tx,
+            udp_to_tun_rx
+        )
+    );
+    let udp_handle = tokio::spawn(
+        udp_io_task(
+            Arc::clone(&socket),
+            Arc::clone(&clients),
+            tun_to_udp_rx,
+            udp_to_tun_tx
+        )
+    );
     info!("Server ready, waiting for connections...");
 
     tokio::signal::ctrl_c().await?;

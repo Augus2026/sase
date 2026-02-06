@@ -188,9 +188,12 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(1000);
 
     let tun_handle = tokio::spawn(
-        tun_io_task(tun, tun_to_udp_tx, udp_to_tun_rx)
+        tun_io_task(
+            tun,
+            tun_to_udp_tx,
+            udp_to_tun_rx
+        )
     );
-
     let udp_handle = tokio::spawn(
         udp_io_task(
             Arc::clone(&socket),
@@ -200,6 +203,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             udp_to_tun_tx,
         )
     );
+    info!("Client {} ready, waiting for connections...", client_id);
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
