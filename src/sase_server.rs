@@ -181,8 +181,15 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     let socket2_socket = socket2::Socket::from(std_socket);
     socket2_socket.set_recv_buffer_size(2 * 1024 * 1024)?;
     socket2_socket.set_send_buffer_size(2 * 1024 * 1024)?;
+
+    let actual_recv_size = socket2_socket.recv_buffer_size()?;
+    let actual_send_size = socket2_socket.send_buffer_size()?;
+
     let local_addr = socket2_socket.local_addr()?.as_socket().expect("Failed to get socket address");
-    info!("Server listening on {} with recv_buffer=2MB, send_buffer=2MB", local_addr);
+    info!("Server listening on {} with recv_buffer={}MB (requested: 2MB), send_buffer={}MB (requested: 2MB)",
+          local_addr,
+          actual_recv_size / 1024 / 1024,
+          actual_send_size / 1024 / 1024);
 
     let socket = UdpSocket::from_std(socket2_socket.into())?;
     let socket = Arc::new(socket);
