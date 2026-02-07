@@ -179,17 +179,19 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     std_socket.set_nonblocking(true)?;
 
     let socket2_socket = socket2::Socket::from(std_socket);
-    socket2_socket.set_recv_buffer_size(2 * 1024 * 1024)?;
-    socket2_socket.set_send_buffer_size(2 * 1024 * 1024)?;
+    socket2_socket.set_recv_buffer_size(config.socket_recv_buffer_size)?;
+    socket2_socket.set_send_buffer_size(config.socket_send_buffer_size)?;
 
     let actual_recv_size = socket2_socket.recv_buffer_size()?;
     let actual_send_size = socket2_socket.send_buffer_size()?;
 
     let local_addr = socket2_socket.local_addr()?.as_socket().expect("Failed to get socket address");
-    info!("Server listening on {} with recv_buffer={}MB (requested: 2MB), send_buffer={}MB (requested: 2MB)",
+    info!("Server listening on {} with recv_buffer={}MB (requested: {}MB), send_buffer={}MB (requested: {}MB)",
           local_addr,
           actual_recv_size / 1024 / 1024,
-          actual_send_size / 1024 / 1024);
+          config.socket_recv_buffer_size / 1024 / 1024,
+          actual_send_size / 1024 / 1024,
+          config.socket_send_buffer_size / 1024 / 1024);
 
     let socket = UdpSocket::from_std(socket2_socket.into())?;
     let socket = Arc::new(socket);
@@ -230,6 +232,8 @@ pub async fn run_server_with_args(
     address: Option<String>,
     netmask: Option<String>,
     mtu: Option<usize>,
+    recv_buffer: Option<usize>,
+    send_buffer: Option<usize>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
 
@@ -251,6 +255,14 @@ pub async fn run_server_with_args(
 
     if let Some(mtu) = mtu {
         config.mtu = mtu;
+    }
+
+    if let Some(recv_buffer_mb) = recv_buffer {
+        config.socket_recv_buffer_size = recv_buffer_mb * 1024 * 1024;
+    }
+
+    if let Some(send_buffer_mb) = send_buffer {
+        config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
     }
 
     debug!("Server configuration: {:?}", config);

@@ -102,6 +102,8 @@ pub struct ClientConfig {
     pub tun_addr: Ipv4Addr,
     pub tun_netmask: Ipv4Addr,
     pub mtu: usize,
+    pub socket_recv_buffer_size: usize,
+    pub socket_send_buffer_size: usize,
 }
 
 impl Default for ClientConfig {
@@ -112,6 +114,8 @@ impl Default for ClientConfig {
             tun_addr: Ipv4Addr::new(10, 0, 0, 2),
             tun_netmask: Ipv4Addr::new(255, 255, 255, 0),
             mtu: TUN_MTU,
+            socket_recv_buffer_size: 8 * 1024 * 1024,
+            socket_send_buffer_size: 8 * 1024 * 1024,
         }
     }
 }
@@ -124,6 +128,8 @@ pub struct ServerConfig {
     pub tun_addr: Ipv4Addr,
     pub tun_netmask: Ipv4Addr,
     pub mtu: usize,
+    pub socket_recv_buffer_size: usize,
+    pub socket_send_buffer_size: usize,
 }
 
 impl Default for ServerConfig {
@@ -134,6 +140,8 @@ impl Default for ServerConfig {
             tun_addr: Ipv4Addr::new(10, 0, 0, 1),
             tun_netmask: Ipv4Addr::new(255, 255, 255, 0),
             mtu: TUN_MTU,
+            socket_recv_buffer_size: 8 * 1024 * 1024,
+            socket_send_buffer_size: 8 * 1024 * 1024,
         }
     }
 }
