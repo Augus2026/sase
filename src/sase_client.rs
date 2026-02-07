@@ -1,4 +1,4 @@
-use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task};
+use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, configure_udp_socket};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
@@ -183,23 +183,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
     std_socket.set_nonblocking(true)?;
 
-    let socket2_socket = socket2::Socket::from(std_socket);
-    socket2_socket.set_recv_buffer_size(config.socket_recv_buffer_size)?;
-    socket2_socket.set_send_buffer_size(config.socket_send_buffer_size)?;
-
-    let actual_recv_size = socket2_socket.recv_buffer_size()?;
-    let actual_send_size = socket2_socket.send_buffer_size()?;
-
-    let local_addr = socket2_socket.local_addr()?.as_socket().expect("Failed to get socket address");
-    info!("Client bound to {} with recv_buffer={}MB (requested: {}MB), send_buffer={}MB (requested: {}MB)",
-          local_addr,
-          actual_recv_size / 1024 / 1024,
-          config.socket_recv_buffer_size / 1024 / 1024,
-          actual_send_size / 1024 / 1024,
-          config.socket_send_buffer_size / 1024 / 1024);
-
-    let socket = UdpSocket::from_std(socket2_socket.into())?;
-    let socket = Arc::new(socket);
+    let socket = configure_udp_socket(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
 
     let client_id = handshake_async(&socket, config.server_addr).await?;
     info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);

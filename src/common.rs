@@ -1,7 +1,10 @@
 use anyhow::Result;
 use log::{debug, info, warn, error};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::net::UdpSocket as StdUdpSocket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
 
 /// VPN protocol configuration
 pub const SERVER_ADDR: &str = "0.0.0.0";
@@ -222,6 +225,31 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
         }
         _ => {}
     }
+}
+
+/// Configure UDP socket with buffer sizes
+pub fn configure_udp_socket(
+    std_socket: StdUdpSocket,
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
+) -> Result<Arc<UdpSocket>> {
+    let socket2_socket = socket2::Socket::from(std_socket);
+    socket2_socket.set_recv_buffer_size(recv_buffer_size)?;
+    socket2_socket.set_send_buffer_size(send_buffer_size)?;
+
+    let actual_recv_size = socket2_socket.recv_buffer_size()?;
+    let actual_send_size = socket2_socket.send_buffer_size()?;
+
+    let local_addr = socket2_socket.local_addr()?.as_socket().expect("Failed to get socket address");
+    info!("Socket bound to {} with recv_buffer={}MB (requested: {}MB), send_buffer={}MB (requested: {}MB)",
+          local_addr,
+          actual_recv_size / 1024 / 1024,
+          recv_buffer_size / 1024 / 1024,
+          actual_send_size / 1024 / 1024,
+          send_buffer_size / 1024 / 1024);
+
+    let socket = UdpSocket::from_std(socket2_socket.into())?;
+    Ok(Arc::new(socket))
 }
 
 /// Common TUN I/O task for handling TUN device read/write operations
