@@ -1,7 +1,7 @@
 use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket};
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::{collections::HashMap, os::raw::c_void};
+use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -14,6 +14,7 @@ struct Client {
     addr: SocketAddr,
     client_id: u32,
     sequence: u32,
+    virtual_ip: Ipv4Addr,
 }
 
 async fn handle_handshake(
@@ -28,10 +29,13 @@ async fn handle_handshake(
     };
 
     if is_new {
+        let virtual_ip = Ipv4Addr::new(10, 0, 0, *next_client_id as u8);
+
         let client = Client {
             addr: src_addr,
             client_id: *next_client_id,
             sequence: 0,
+            virtual_ip,
         };
 
         {
@@ -39,7 +43,7 @@ async fn handle_handshake(
             clients_map.insert(*next_client_id, client.clone());
         }
 
-        info!("Client {} connected from {}", next_client_id, src_addr);
+        info!("Client {} connected from {}, assigned IP: {}", next_client_id, src_addr, virtual_ip);
 
         let response = VpnPacket::new(
             PacketType::Handshake,
@@ -109,32 +113,40 @@ async fn handle_disconnect(
     }
 }
 
-async fn broadcast_to_clients(
-    data: Vec<u8>,
+fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
+    if data.len() < 20 {
+        return None;
+    }
+
+    let version_ihl = data[0];
+    let version = version_ihl >> 4;
+    if version != 4 {
+        return None;
+    }
+
+    let dest_ip_bytes: [u8; 4] = data[16..20].try_into().ok()?;
+    Some(Ipv4Addr::from(dest_ip_bytes))
+}
+
+async fn send_to_client(
+    data: &[u8],
     socket: &UdpSocket,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+    client: &Client,
 ) {
-    let clients_map = clients.lock().await;
-    let client_count = clients_map.len();
-    if !clients_map.is_empty() {
-        for (_id, client) in clients_map.iter() {
-            let packet = VpnPacket::new(
-                PacketType::Data,
-                client.client_id,
-                client.sequence,
-                data.len() as u16,
-            );
+    let packet = VpnPacket::new(
+        PacketType::Data,
+        client.client_id,
+        client.sequence,
+        data.len() as u16,
+    );
 
-            let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
-            send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
-            send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
+    let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
+    send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
+    send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
-            print_packet_info("[udp write]", &send_buf);
-            if let Err(e) = socket.send_to(&send_buf, client.addr).await {
-                warn!("Failed to send to {}: {}", client.addr, e);
-            }
-        }
-        debug!("Broadcasted data to {} client(s)", client_count);
+    print_packet_info("[udp write]", &send_buf);
+    if let Err(e) = socket.send_to(&send_buf, client.addr).await {
+        warn!("Failed to send to {}: {}", client.addr, e);
     }
 }
 
@@ -210,7 +222,13 @@ async fn udp_io_task(
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
-                        broadcast_to_clients(data, &socket, &clients).await;
+                        let clients_map = clients.lock().await;
+                        if let Some(dest_ip) = get_destination_ip(&data) {
+                            let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+                            if let Some(client) = target_client {
+                                send_to_client(&data, &socket, client).await;
+                            }
+                        }
                     }
                     None => {
                         error!("UDP: Channel disconnected");
@@ -223,8 +241,6 @@ async fn udp_io_task(
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
-    info!("Starting server with configuration: {}", config.bind_addr);
-
     let mut tun_config = Configuration::default();
     tun_config
         .tun_name(&config.tun_name)
@@ -233,19 +249,13 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         .address(config.tun_addr)
         .netmask(config.tun_netmask)
         .up();
-
-    info!("Creating TUN device: {}", config.tun_name);
     let tun = create_as_async(&tun_config)?;
-    info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
     let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
     std_socket.set_nonblocking(true)?;
-
     let socket = configure_udp_socket(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
-
     let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
     let tun_handle = tokio::spawn(
         tun_io_task(
