@@ -1,7 +1,7 @@
 use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket};
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::{collections::HashMap, os::raw::c_void};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -14,6 +14,153 @@ struct Client {
     addr: SocketAddr,
     client_id: u32,
     sequence: u32,
+}
+
+async fn handle_handshake(
+    src_addr: SocketAddr,
+    socket: &UdpSocket,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+    next_client_id: &mut u32,
+) {
+    let is_new = {
+        let clients_map = clients.lock().await;
+        !clients_map.values().any(|c| c.addr == src_addr)
+    };
+
+    if is_new {
+        let client = Client {
+            addr: src_addr,
+            client_id: *next_client_id,
+            sequence: 0,
+        };
+
+        {
+            let mut clients_map = clients.lock().await;
+            clients_map.insert(*next_client_id, client.clone());
+        }
+
+        info!("Client {} connected from {}", next_client_id, src_addr);
+
+        let response = VpnPacket::new(
+            PacketType::Handshake,
+            *next_client_id,
+            0,
+            0,
+        );
+        let response_buf = response.to_bytes();
+        if let Err(e) = socket.send_to(&response_buf, src_addr).await {
+            error!("Failed to send handshake to {}: {}", src_addr, e);
+        }
+
+        *next_client_id = next_client_id.wrapping_add(1);
+    } else {
+        debug!("Handshake from existing client {}", src_addr);
+    }
+}
+
+async fn handle_data(
+    header: &VpnPacket,
+    data: &[u8],
+    tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> bool {
+    let payload_start = VpnPacket::HEADER_SIZE;
+    let payload_end = payload_start + header.length as usize;
+
+    if payload_end <= data.len() {
+        let payload = data[payload_start..payload_end].to_vec();
+        print_packet_info("[udp read]", &payload);
+        if let Err(e) = tun_tx.send(payload).await {
+            error!("Failed to send to TUN writer: {}", e);
+            true
+        } else {
+            false
+        }
+    } else {
+        warn!("Invalid payload length from client {}", header.client_id);
+        false
+    }
+}
+
+async fn handle_keepalive(
+    header: &VpnPacket,
+    src_addr: SocketAddr,
+    socket: &UdpSocket,
+) {
+    debug!("Keepalive received from client {}", header.client_id);
+    let response = VpnPacket::new(
+        PacketType::KeepAlive,
+        header.client_id,
+        header.sequence,
+        0,
+    );
+    let response_buf = response.to_bytes();
+    if let Err(e) = socket.send_to(&response_buf, src_addr).await {
+        warn!("Failed to send keepalive response to {}: {}", src_addr, e);
+    }
+}
+
+async fn handle_disconnect(
+    header: &VpnPacket,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+) {
+    let mut clients_map = clients.lock().await;
+    if let Some(client) = clients_map.remove(&header.client_id) {
+        info!("Client {} disconnected ({})", header.client_id, client.addr);
+    }
+}
+
+async fn broadcast_to_clients(
+    data: Vec<u8>,
+    socket: &UdpSocket,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+) {
+    let clients_map = clients.lock().await;
+    let client_count = clients_map.len();
+    if !clients_map.is_empty() {
+        for (_id, client) in clients_map.iter() {
+            let packet = VpnPacket::new(
+                PacketType::Data,
+                client.client_id,
+                client.sequence,
+                data.len() as u16,
+            );
+
+            let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
+            send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
+            send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
+
+            print_packet_info("[udp write]", &send_buf);
+            if let Err(e) = socket.send_to(&send_buf, client.addr).await {
+                warn!("Failed to send to {}: {}", client.addr, e);
+            }
+        }
+        debug!("Broadcasted data to {} client(s)", client_count);
+    }
+}
+
+async fn handle_message(
+    header: VpnPacket,
+    data: &[u8],
+    src_addr: SocketAddr,
+    socket: &UdpSocket,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+    next_client_id: &mut u32,
+    tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    match header.packet_type {
+        PacketType::Handshake => {
+            handle_handshake(src_addr, socket, clients, next_client_id).await;
+        }
+        PacketType::Data => {
+            handle_data(&header, data, tun_tx).await;
+        }
+        PacketType::KeepAlive => {
+            handle_keepalive(&header, src_addr, socket).await;
+        }
+        PacketType::Disconnect => {
+            handle_disconnect(&header, clients).await;
+        }
+    }
 }
 
 async fn udp_io_task(
@@ -38,78 +185,15 @@ async fn udp_io_task(
 
                         match VpnPacket::from_bytes(&udp_buf[..n]) {
                             Ok(header) => {
-                                match header.packet_type {
-                                    PacketType::Handshake => {
-                                        let is_new = {
-                                            let clients_map = clients.lock().await;
-                                            !clients_map.values().any(|c| c.addr == src_addr)
-                                        };
-
-                                        if is_new {
-                                            let client = Client {
-                                                addr: src_addr,
-                                                client_id: next_client_id,
-                                                sequence: 0,
-                                            };
-
-                                            {
-                                                let mut clients_map = clients.lock().await;
-                                                clients_map.insert(next_client_id, client.clone());
-                                            }
-
-                                            info!("Client {} connected from {}", next_client_id, src_addr);
-
-                                            let response = VpnPacket::new(
-                                                PacketType::Handshake,
-                                                next_client_id,
-                                                0,
-                                                0,
-                                            );
-                                            let response_buf = response.to_bytes();
-                                            if let Err(e) = socket.send_to(&response_buf, src_addr).await {
-                                                error!("Failed to send handshake to {}: {}", src_addr, e);
-                                            }
-
-                                            next_client_id = next_client_id.wrapping_add(1);
-                                        } else {
-                                            debug!("Handshake from existing client {}", src_addr);
-                                        }
-                                    }
-                                    PacketType::Data => {
-                                        let payload_start = VpnPacket::HEADER_SIZE;
-                                        let payload_end = payload_start + header.length as usize;
-
-                                        if payload_end <= n {
-                                            let payload = udp_buf[payload_start..payload_end].to_vec();
-                                            print_packet_info("[udp read]", &payload);
-                                            if let Err(e) = tun_tx.send(payload).await {
-                                                error!("Failed to send to TUN writer: {}", e);
-                                                break;
-                                            }
-                                        } else {
-                                            warn!("Invalid payload length from client {}", header.client_id);
-                                        }
-                                    }
-                                    PacketType::KeepAlive => {
-                                        debug!("Keepalive received from client {}", header.client_id);
-                                        let response = VpnPacket::new(
-                                            PacketType::KeepAlive,
-                                            header.client_id,
-                                            header.sequence,
-                                            0,
-                                        );
-                                        let response_buf = response.to_bytes();
-                                        if let Err(e) = socket.send_to(&response_buf, src_addr).await {
-                                            warn!("Failed to send keepalive response to {}: {}", src_addr, e);
-                                        }
-                                    }
-                                    PacketType::Disconnect => {
-                                        let mut clients_map = clients.lock().await;
-                                        if let Some(client) = clients_map.remove(&header.client_id) {
-                                            info!("Client {} disconnected ({})", header.client_id, client.addr);
-                                        }
-                                    }
-                                }
+                                handle_message(
+                                    header,
+                                    &udp_buf[..n],
+                                    src_addr,
+                                    &socket,
+                                    &clients,
+                                    &mut next_client_id,
+                                    &tun_tx,
+                                ).await;
                             }
                             Err(e) => {
                                 debug!("Failed to parse packet from {}: {}", src_addr, e);
@@ -126,28 +210,7 @@ async fn udp_io_task(
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
-                        let clients_map = clients.lock().await;
-                        let client_count = clients_map.len();
-                        if !clients_map.is_empty() {
-                            for (_id, client) in clients_map.iter() {
-                                let packet = VpnPacket::new(
-                                    PacketType::Data,
-                                    client.client_id,
-                                    client.sequence,
-                                    data.len() as u16,
-                                );
-
-                                let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
-                                send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
-                                send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
-
-                                print_packet_info("[udp write]", &send_buf);
-                                if let Err(e) = socket.send_to(&send_buf, client.addr).await {
-                                    warn!("Failed to send to {}: {}", client.addr, e);
-                                }
-                            }
-                            debug!("Broadcasted data to {} client(s)", client_count);
-                        }
+                        broadcast_to_clients(data, &socket, &clients).await;
                     }
                     None => {
                         error!("UDP: Channel disconnected");
