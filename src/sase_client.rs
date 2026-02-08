@@ -63,102 +63,150 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
     }
 }
 
-async fn udp_io_task(
+struct VpnClient {
     socket: Arc<UdpSocket>,
     server_addr: std::net::SocketAddr,
     client_id: u32,
-    mut tun_rx: mpsc::Receiver<Vec<u8>>,
+    sequence: u32,
     tun_tx: mpsc::Sender<Vec<u8>>,
-) {
-    let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
-    let mut keepalive_interval = interval(Duration::from_secs(10));
-    let mut sequence = 0u32;
-    info!("UDP I/O task started for client {}", client_id);
+}
 
-    loop {
-        tokio::select! {
-            result = socket.recv_from(&mut udp_buf) => {
-                match result {
-                    Ok((n, src_addr)) => {
-                        if src_addr != server_addr {
-                            debug!("UDP: Received packet from unexpected address: {}", src_addr);
-                            continue;
-                        }
+impl VpnClient {
+    fn new(
+        socket: Arc<UdpSocket>,
+        server_addr: std::net::SocketAddr,
+        client_id: u32,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Self {
+        Self {
+            socket,
+            server_addr,
+            client_id,
+            sequence: 0,
+            tun_tx,
+        }
+    }
 
-                        if n < VpnPacket::HEADER_SIZE {
-                            debug!("UDP: Received short packet");
-                            continue;
-                        }
+    async fn handle_data_from_server(&self, header: &VpnPacket, udp_buf: &[u8], packet_size: usize) -> bool {
+        let payload_start = VpnPacket::HEADER_SIZE;
+        let payload_end = payload_start + header.length as usize;
 
-                        match VpnPacket::from_bytes(&udp_buf[..n]) {
-                            Ok(header) => {
-                                if header.client_id != client_id {
-                                    continue;
-                                }
+        if payload_end <= packet_size {
+            let payload = udp_buf[payload_start..payload_end].to_vec();
+            if let Err(e) = self.tun_tx.send(payload).await {
+                error!("UDP: Failed to send to TUN: {}", e);
+                return false;
+            }
+        }
 
-                                match header.packet_type {
-                                    PacketType::Data => {
-                                        let payload_start = VpnPacket::HEADER_SIZE;
-                                        let payload_end = payload_start + header.length as usize;
+        true
+    }
 
-                                        if payload_end <= n {
-                                            let payload = udp_buf[payload_start..payload_end].to_vec();
-                                            if let Err(e) = tun_tx.send(payload).await {
-                                                error!("UDP: Failed to send to TUN: {}", e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    PacketType::KeepAlive => {
-                                        debug!("Keepalive received from server");
-                                    }
-                                    PacketType::Disconnect => {
-                                        warn!("Server disconnected");
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Err(e) => {
-                                debug!("UDP: Failed to parse packet: {}", e);
-                            }
-                        }
+    async fn handle_keepalive_from_server(&self) {
+        debug!("Keepalive received from server");
+    }
+
+    async fn handle_disconnect_from_server(&self) -> bool {
+        warn!("Server disconnected");
+        false
+    }
+
+    async fn send_data_to_server(&mut self, data: Vec<u8>) {
+        let packet = VpnPacket::new(PacketType::Data, self.client_id, self.sequence, data.len() as u16);
+        self.sequence = self.sequence.wrapping_add(1);
+
+        let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
+        send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
+        send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
+
+        if let Err(e) = self.socket.send_to(&send_buf, self.server_addr).await {
+            warn!("UDP: Failed to send to server: {}", e);
+        }
+    }
+
+    async fn send_keepalive_to_server(&mut self) {
+        let packet = VpnPacket::new(PacketType::KeepAlive, self.client_id, self.sequence, 0);
+        self.sequence = self.sequence.wrapping_add(1);
+        let buf = packet.to_bytes();
+
+        if let Err(e) = self.socket.send_to(&buf, self.server_addr).await {
+            warn!("Keepalive: Failed to send: {}", e);
+        }
+    }
+
+    async fn process_udp_packet(&mut self, udp_buf: &[u8], packet_size: usize, src_addr: std::net::SocketAddr) -> bool {
+        if src_addr != self.server_addr {
+            debug!("UDP: Received packet from unexpected address: {}", src_addr);
+            return true;
+        }
+
+        if packet_size < VpnPacket::HEADER_SIZE {
+            debug!("UDP: Received short packet");
+            return true;
+        }
+
+        match VpnPacket::from_bytes(&udp_buf[..packet_size]) {
+            Ok(header) => {
+                if header.client_id != self.client_id {
+                    return true;
+                }
+
+                match header.packet_type {
+                    PacketType::Data => {
+                        self.handle_data_from_server(&header, udp_buf, packet_size).await
                     }
-                    Err(e) => {
-                        error!("UDP: Error receiving: {}", e);
-                        break;
+                    PacketType::KeepAlive => {
+                        self.handle_keepalive_from_server().await;
+                        true
                     }
+                    PacketType::Disconnect => {
+                        self.handle_disconnect_from_server().await
+                    }
+                    _ => true,
                 }
             }
+            Err(e) => {
+                debug!("UDP: Failed to parse packet: {}", e);
+                true
+            }
+        }
+    }
 
-            result = tun_rx.recv() => {
-                match result {
-                    Some(data) => {
-                        let packet = VpnPacket::new(PacketType::Data, client_id, sequence, data.len() as u16);
-                        sequence = sequence.wrapping_add(1);
+    async fn run(&mut self, mut tun_rx: mpsc::Receiver<Vec<u8>>) {
+        let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
+        let mut keepalive_interval = interval(Duration::from_secs(10));
+        info!("UDP I/O task started for client {}", self.client_id);
 
-                        let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
-                        send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
-                        send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
-
-                        if let Err(e) = socket.send_to(&send_buf, server_addr).await {
-                            warn!("UDP: Failed to send to server: {}", e);
+        loop {
+            tokio::select! {
+                result = self.socket.recv_from(&mut udp_buf) => {
+                    match result {
+                        Ok((n, src_addr)) => {
+                            if !self.process_udp_packet(&udp_buf, n, src_addr).await {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("UDP: Error receiving: {}", e);
+                            break;
                         }
                     }
-                    None => {
-                        error!("UDP: Channel disconnected");
-                        break;
+                }
+
+                result = tun_rx.recv() => {
+                    match result {
+                        Some(data) => {
+                            self.send_data_to_server(data).await;
+                        }
+                        None => {
+                            error!("UDP: Channel disconnected");
+                            break;
+                        }
                     }
                 }
-            }
 
-            _ = keepalive_interval.tick() => {
-                let packet = VpnPacket::new(PacketType::KeepAlive, client_id, sequence, 0);
-                sequence = sequence.wrapping_add(1);
-                let buf = packet.to_bytes();
-
-                if let Err(e) = socket.send_to(&buf, server_addr).await {
-                    warn!("Keepalive: Failed to send: {}", e);
+                _ = keepalive_interval.tick() => {
+                    self.send_keepalive_to_server().await;
                 }
             }
         }
@@ -198,15 +246,16 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             udp_to_tun_rx
         )
     );
-    let udp_handle = tokio::spawn(
-        udp_io_task(
-            Arc::clone(&socket),
-            config.server_addr,
-            client_id,
-            tun_to_udp_rx,
-            udp_to_tun_tx,
-        )
+
+    let mut client = VpnClient::new(
+        Arc::clone(&socket),
+        config.server_addr,
+        client_id,
+        udp_to_tun_tx,
     );
+    let udp_handle = tokio::spawn(async move {
+        client.run(tun_to_udp_rx).await
+    });
     info!("Client {} is running, press Ctrl+C to stop", client_id);
 
     tokio::signal::ctrl_c().await?;
