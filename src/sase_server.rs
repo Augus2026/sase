@@ -1,4 +1,4 @@
-use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket};
+use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket, TransparentProxyConfig};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -272,6 +272,19 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
             udp_to_tun_tx
         )
     );
+
+    // Start transparent proxy if enabled
+    let proxy_handle = if config.transparent_proxy.enabled {
+        info!("Transparent proxy enabled on port {}", config.transparent_proxy.redirect_port);
+        Some(tokio::spawn(async move {
+            if let Err(e) = start_transparent_proxy(config.transparent_proxy).await {
+                error!("Transparent proxy error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     info!("Server ready, waiting for client connections...");
 
     tokio::signal::ctrl_c().await?;
@@ -279,7 +292,142 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
     tun_handle.abort();
     udp_handle.abort();
+    if let Some(handle) = proxy_handle {
+        handle.abort();
+    }
 
+    Ok(())
+}
+
+/// Start transparent proxy with iptables redirection (Linux only)
+#[cfg(target_os = "linux")]
+async fn start_transparent_proxy(config: TransparentProxyConfig) -> Result<()> {
+    use tokio::net::TcpListener;
+
+    // Setup iptables for transparent proxying
+    info!("Setting up iptables for transparent proxy...");
+    setup_iptables_rules(&config).await?;
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", config.redirect_port)).await?;
+    info!("Transparent proxy listening on port {}", config.redirect_port);
+
+    loop {
+        match listener.accept().await {
+            Ok((mut socket, addr)) => {
+                debug!("Accepted transparent proxy connection from {}", addr);
+
+                // Get original destination using SO_ORIGINAL_DST
+                let original_dst = get_original_dst(&socket)?;
+                info!("Proxying {} to {}", addr, original_dst);
+
+                tokio::spawn(async move {
+                    if let Err(e) = proxy_connection(socket, original_dst).await {
+                        error!("Proxy error: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to accept connection: {}", e);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_original_dst(socket: &tokio::net::TcpStream) -> Result<SocketAddr> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+        let ret = libc::getsockopt(
+            fd,
+            libc::SOL_IP,
+            libc::SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len as *mut libc::socklen_t,
+        );
+
+        if ret != 0 {
+            return Err(anyhow::anyhow!("Failed to get original destination"));
+        }
+
+        if addr.ss_family == libc::AF_INET {
+            let addr_in = &addr as *const libc::sockaddr_storage as *const libc::sockaddr_in;
+            let ip = Ipv4Addr::from((*addr_in).sin_addr.s_addr.to_be());
+            let port = u16::from_be((*addr_in).sin_port);
+            Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        } else {
+            anyhow::bail!("Only IPv4 is supported");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn proxy_connection(mut client: tokio::net::TcpStream, target: SocketAddr) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    match tokio::net::TcpStream::connect(target).await {
+        Ok(mut server) => {
+            let (mut client_read, mut client_write) = client.split();
+            let (mut server_read, mut server_write) = server.split();
+
+            let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
+            let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
+
+            tokio::select! {
+                res = client_to_server => { if let Err(e) = res { debug!("Client to server error: {}", e); } }
+                res = server_to_client => { if let Err(e) = res { debug!("Server to client error: {}", e); } }
+            }
+        }
+        Err(e) => {
+            error!("Failed to connect to target {}: {}", target, e);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn setup_iptables_rules(config: &TransparentProxyConfig) -> Result<()> {
+    use tokio::process::Command;
+
+    // Enable IP forwarding
+    tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
+
+    // Create iptables chain
+    let commands = vec![
+        "-t nat -N SASE_PROXY",
+        &format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", config.redirect_port),
+        "-t nat -A OUTPUT -j SASE_PROXY",
+        "-t nat -A PREROUTING -j SASE_PROXY",
+        "-t nat -I SASE_PROXY -o lo -j RETURN",
+        "-t nat -I SASE_PROXY -d 10.0.0.0/24 -j RETURN",
+    ];
+
+    for cmd in commands {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let result = Command::new("iptables")
+            .args(&parts)
+            .output()
+            .await;
+
+        if let Ok(output) = result {
+            if !output.status.success() {
+                warn!("iptables command failed: {}", cmd);
+            }
+        }
+    }
+
+    info!("iptables rules configured");
+    Ok(())
+}
+
+// Stub implementations for non-Linux platforms
+#[cfg(not(target_os = "linux"))]
+async fn start_transparent_proxy(_config: TransparentProxyConfig) -> Result<()> {
+    info!("Transparent proxy is only supported on Linux");
     Ok(())
 }
 
@@ -291,6 +439,8 @@ pub async fn run_server_with_args(
     mtu: Option<usize>,
     recv_buffer: Option<usize>,
     send_buffer: Option<usize>,
+    transparent_proxy: bool,
+    proxy_port: Option<u16>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
 
@@ -320,6 +470,12 @@ pub async fn run_server_with_args(
 
     if let Some(send_buffer_mb) = send_buffer {
         config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
+    }
+
+    // Configure transparent proxy
+    config.transparent_proxy.enabled = transparent_proxy;
+    if let Some(port) = proxy_port {
+        config.transparent_proxy.redirect_port = port;
     }
 
     debug!("Server configuration: {:?}", config);

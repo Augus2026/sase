@@ -47,6 +47,14 @@ enum Commands {
         #[arg(long)]
         send_buffer: Option<usize>,
 
+        /// Enable transparent proxy mode (Linux only)
+        #[arg(long)]
+        transparent_proxy: bool,
+
+        /// Transparent proxy redirect port (default: 1080)
+        #[arg(long)]
+        proxy_port: Option<u16>,
+
         /// Verbose logging
         #[arg(short, long)]
         verbose: bool,
@@ -100,6 +108,8 @@ async fn main() -> Result<()> {
             mtu,
             recv_buffer,
             send_buffer,
+            transparent_proxy,
+            proxy_port,
             verbose,
         } => {
             env_logger::Builder::from_env(
@@ -108,7 +118,10 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Server");
-            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer).await
+            if transparent_proxy {
+                info!("Transparent proxy mode enabled");
+            }
+            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer, transparent_proxy, proxy_port).await
         }
         Commands::Client {
             server,

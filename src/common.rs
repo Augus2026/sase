@@ -133,6 +133,7 @@ pub struct ServerConfig {
     pub mtu: usize,
     pub socket_recv_buffer_size: usize,
     pub socket_send_buffer_size: usize,
+    pub transparent_proxy: TransparentProxyConfig,
 }
 
 impl Default for ServerConfig {
@@ -145,6 +146,7 @@ impl Default for ServerConfig {
             mtu: TUN_MTU,
             socket_recv_buffer_size: 8 * 1024 * 1024,
             socket_send_buffer_size: 8 * 1024 * 1024,
+            transparent_proxy: TransparentProxyConfig::default(),
         }
     }
 }
@@ -294,6 +296,22 @@ pub async fn tun_io_task(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Transparent proxy configuration
+#[derive(Debug, Clone)]
+pub struct TransparentProxyConfig {
+    pub enabled: bool,
+    pub redirect_port: u16,
+}
+
+impl Default for TransparentProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redirect_port: 1080,
         }
     }
 }
