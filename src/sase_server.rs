@@ -395,18 +395,35 @@ async fn setup_iptables_rules(config: &TransparentProxyConfig) -> Result<()> {
     // Enable IP forwarding
     tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
 
-    // Create iptables chain
+    // Flush existing rules and remove chain before adding new ones
+    let cleanup_commands = vec![
+        "-t nat -D OUTPUT -j SASE_PROXY",
+        "-t nat -D PREROUTING -j SASE_PROXY",
+        "-t nat -F SASE_PROXY",
+        "-t nat -X SASE_PROXY",
+    ];
+
+    for cmd in cleanup_commands {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let _ = Command::new("iptables")
+            .args(&parts)
+            .output()
+            .await;
+        // Ignore errors during cleanup (rules might not exist)
+    }
+
+    // Create iptables chain and add rules
     let redirect_rule = format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", config.redirect_port);
-    let commands = vec![
+    let setup_commands = vec![
         "-t nat -N SASE_PROXY",
+        "-t nat -A SASE_PROXY -o lo -j RETURN",
+        "-t nat -A SASE_PROXY -d 10.0.0.0/24 -j RETURN",
         redirect_rule.as_str(),
         "-t nat -A OUTPUT -j SASE_PROXY",
         "-t nat -A PREROUTING -j SASE_PROXY",
-        "-t nat -I SASE_PROXY -o lo -j RETURN",
-        "-t nat -I SASE_PROXY -d 10.0.0.0/24 -j RETURN",
     ];
 
-    for cmd in commands {
+    for cmd in setup_commands {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         let result = Command::new("iptables")
             .args(&parts)
