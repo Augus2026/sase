@@ -278,8 +278,9 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         info!("Transparent proxy enabled on port {} for interface {}",
               config.transparent_proxy.redirect_port, config.transparent_proxy.tun_interface);
         let server_config = config.clone();
+        let proxy_config = server_config.transparent_proxy.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = start_transparent_proxy(server_config.transparent_proxy, server_config).await {
+            if let Err(e) = start_transparent_proxy(proxy_config, server_config).await {
                 error!("Transparent proxy error: {}", e);
             }
         }))
@@ -401,10 +402,10 @@ async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
     tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
 
     // Flush existing rules and remove chain before adding new ones
-    let cleanup_commands = vec![
+    let cleanup_commands: Vec<String> = vec![
         format!("-t nat -D PREROUTING -i {} -j SASE_PROXY", tun_if),
-        "-t nat -F SASE_PROXY",
-        "-t nat -X SASE_PROXY",
+        "-t nat -F SASE_PROXY".to_string(),
+        "-t nat -X SASE_PROXY".to_string(),
     ];
 
     for cmd in cleanup_commands {
@@ -419,14 +420,14 @@ async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
     // Create iptables chain and add rules - ONLY for TUN interface traffic
     let redirect_rule = format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", proxy_port);
     let tun_network = format!("{}/24", config.tun_addr);
-    let setup_commands = vec![
-        "-t nat -N SASE_PROXY",
+    let setup_commands: Vec<String> = vec![
+        "-t nat -N SASE_PROXY".to_string(),
         // Skip traffic to VPN network (don't proxy connections to VPN IPs)
-        format!("-t nat -A SASE_PROXY -d {} -j RETURN", tun_network).as_str(),
+        format!("-t nat -A SASE_PROXY -d {} -j RETURN", tun_network),
         // Redirect all other TCP traffic
-        redirect_rule.as_str(),
+        redirect_rule,
         // Only apply to traffic coming from TUN interface (not OUTPUT or physical interfaces)
-        format!("-t nat -A PREROUTING -i {} -p tcp -j SASE_PROXY", tun_if).as_str(),
+        format!("-t nat -A PREROUTING -i {} -p tcp -j SASE_PROXY", tun_if),
     ];
 
     for cmd in setup_commands {
@@ -449,8 +450,13 @@ async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
 
 // Stub implementations for non-Linux platforms
 #[cfg(not(target_os = "linux"))]
-async fn start_transparent_proxy(_config: TransparentProxyConfig) -> Result<()> {
+async fn start_transparent_proxy(_config: TransparentProxyConfig, _server_config: ServerConfig) -> Result<()> {
     info!("Transparent proxy is only supported on Linux");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn setup_iptables_rules(_config: &ServerConfig) -> Result<()> {
     Ok(())
 }
 
