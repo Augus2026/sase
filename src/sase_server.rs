@@ -305,34 +305,18 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 /// Start transparent proxy with iptables redirection (Linux only)
 #[cfg(target_os = "linux")]
 async fn start_transparent_proxy(config: TransparentProxyConfig, server_config: ServerConfig) -> Result<()> {
-    use tokio::net::TcpListener;
+    use tokio::time::{sleep, Duration};
 
     // Setup iptables for transparent proxying
-    info!("Setting up iptables for transparent proxy...");
+    info!("[PROXY] Setting up iptables for NAT on interface {}...", server_config.transparent_proxy.tun_interface);
     setup_iptables_rules(&server_config).await?;
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", config.redirect_port)).await?;
-    info!("Transparent proxy listening on port {}", config.redirect_port);
+    info!("[PROXY] NAT mode enabled - TUN traffic will be MASQUERADE'd to physical interface");
+    info!("[PROXY] Kernel will handle packet forwarding, no TCP proxy needed");
 
+    // Keep the task alive but do nothing - kernel handles the forwarding
     loop {
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                debug!("Accepted transparent proxy connection from {}", addr);
-
-                // Get original destination using SO_ORIGINAL_DST
-                let original_dst = get_original_dst(&socket)?;
-                info!("Proxying {} to {}", addr, original_dst);
-
-                tokio::spawn(async move {
-                    if let Err(e) = proxy_connection(socket, original_dst).await {
-                        error!("Proxy error: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                error!("Failed to accept connection: {}", e);
-            }
-        }
+        sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -396,16 +380,18 @@ async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
     use tokio::process::Command;
 
     let tun_if = &config.transparent_proxy.tun_interface;
-    let proxy_port = config.transparent_proxy.redirect_port;
+
+    // Get physical interface (first non-lo interface)
+    let physical_if = "ens33"; // TODO: Make this configurable
 
     // Enable IP forwarding
     tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
 
-    // Flush existing rules and remove chain before adding new ones
+    // Flush existing rules
     let cleanup_commands: Vec<String> = vec![
-        format!("-t nat -D PREROUTING -i {} -j SASE_PROXY", tun_if),
-        "-t nat -F SASE_PROXY".to_string(),
-        "-t nat -X SASE_PROXY".to_string(),
+        format!("-t nat -D POSTROUTING -o {} -j MASQUERADE", physical_if),
+        format!("-t filter -D FORWARD -i {} -j ACCEPT", tun_if),
+        format!("-t filter -D FORWARD -o {} -j ACCEPT", tun_if),
     ];
 
     for cmd in cleanup_commands {
@@ -414,20 +400,15 @@ async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
             .args(&parts)
             .output()
             .await;
-        // Ignore errors during cleanup (rules might not exist)
     }
 
-    // Create iptables chain and add rules - ONLY for TUN interface traffic
-    let redirect_rule = format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", proxy_port);
-    let tun_network = format!("{}/24", config.tun_addr);
+    // Setup NAT and forwarding rules
     let setup_commands: Vec<String> = vec![
-        "-t nat -N SASE_PROXY".to_string(),
-        // Skip traffic to VPN network (don't proxy connections to VPN IPs)
-        format!("-t nat -A SASE_PROXY -d {} -j RETURN", tun_network),
-        // Redirect all other TCP traffic
-        redirect_rule,
-        // Only apply to traffic coming from TUN interface (not OUTPUT or physical interfaces)
-        format!("-t nat -A PREROUTING -i {} -p tcp -j SASE_PROXY", tun_if),
+        // Allow forwarding from TUN to physical interface
+        format!("-t filter -A FORWARD -i {} -o {} -j ACCEPT", tun_if, physical_if),
+        format!("-t filter -A FORWARD -o {} -i {} -j ACCEPT", tun_if, physical_if),
+        // MASQUERADE traffic going out to physical interface
+        format!("-t nat -A POSTROUTING -o {} -j MASQUERADE", physical_if),
     ];
 
     for cmd in setup_commands {
@@ -444,7 +425,7 @@ async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
         }
     }
 
-    info!("iptables rules configured for TUN interface {} only", tun_if);
+    info!("iptables rules configured: TUN {} <-> Physical {} with MASQUERADE", tun_if, physical_if);
     Ok(())
 }
 
