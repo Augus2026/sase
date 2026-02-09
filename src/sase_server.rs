@@ -313,7 +313,7 @@ async fn start_transparent_proxy(config: TransparentProxyConfig) -> Result<()> {
 
     loop {
         match listener.accept().await {
-            Ok((mut socket, addr)) => {
+            Ok((socket, addr)) => {
                 debug!("Accepted transparent proxy connection from {}", addr);
 
                 // Get original destination using SO_ORIGINAL_DST
@@ -367,7 +367,6 @@ fn get_original_dst(socket: &tokio::net::TcpStream) -> Result<SocketAddr> {
 
 #[cfg(target_os = "linux")]
 async fn proxy_connection(mut client: tokio::net::TcpStream, target: SocketAddr) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     match tokio::net::TcpStream::connect(target).await {
         Ok(mut server) => {
@@ -397,9 +396,10 @@ async fn setup_iptables_rules(config: &TransparentProxyConfig) -> Result<()> {
     tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
 
     // Create iptables chain
+    let redirect_rule = format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", config.redirect_port);
     let commands = vec![
         "-t nat -N SASE_PROXY",
-        &format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", config.redirect_port),
+        redirect_rule.as_str(),
         "-t nat -A OUTPUT -j SASE_PROXY",
         "-t nat -A PREROUTING -j SASE_PROXY",
         "-t nat -I SASE_PROXY -o lo -j RETURN",

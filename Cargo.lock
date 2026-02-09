@@ -10,6 +10,7 @@ dependencies = [
  "clap",
  "env_logger",
  "etherparse",
+ "libc",
  "log",
  "socket2 0.5.10",
  "tokio",
