@@ -306,31 +306,59 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn start_transparent_proxy(config: TransparentProxyConfig, server_config: ServerConfig) -> Result<()> {
     use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
 
     // Setup iptables for transparent proxying
-    info!("Setting up iptables for transparent proxy...");
+    info!("[PROXY] Setting up iptables for transparent proxy on interface {}...", server_config.transparent_proxy.tun_interface);
     setup_iptables_rules(&server_config).await?;
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", config.redirect_port)).await?;
-    info!("Transparent proxy listening on port {}", config.redirect_port);
+    let bind_addr = format!("0.0.0.0:{}", config.redirect_port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    info!("[PROXY] Transparent proxy listening on {}", bind_addr);
+
+    // Limit concurrent connections to prevent file descriptor exhaustion
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
+    let mut active_connections: usize = 0;
+    let mut total_connections: u64 = 0;
+
+    info!("[PROXY] Ready to accept connections (max 500 concurrent)");
 
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
-                debug!("Accepted transparent proxy connection from {}", addr);
+                total_connections += 1;
 
                 // Get original destination using SO_ORIGINAL_DST
-                let original_dst = get_original_dst(&socket)?;
-                info!("Proxying {} to {}", addr, original_dst);
+                match get_original_dst(&socket) {
+                    Ok(original_dst) => {
+                        // Acquire semaphore permit (with timeout to prevent blocking)
+                        let permit = match timeout(Duration::from_secs(5), semaphore.clone().acquire().await).await {
+                            Ok(Ok(p)) => p,
+                            _ => {
+                                warn!("[PROXY] Connection limit reached (500), dropping connection {} from {} to {}",
+                                      total_connections, addr, original_dst);
+                                continue;
+                            }
+                        };
 
-                tokio::spawn(async move {
-                    if let Err(e) = proxy_connection(socket, original_dst).await {
-                        error!("Proxy error: {}", e);
+                        active_connections += 1;
+                        info!("[PROXY] [#{}] Accepting {} -> {} [active: {}]",
+                              total_connections, addr, original_dst, active_connections);
+
+                        tokio::spawn(async move {
+                            let _permit = permit; // Release permit when done
+                            if let Err(e) = proxy_connection(socket, original_dst).await {
+                                error!("[PROXY] Error proxying {}: {}", original_dst, e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        error!("[PROXY] Failed to get original destination for {}: {}", addr, e);
+                    }
+                }
             }
             Err(e) => {
-                error!("Failed to accept connection: {}", e);
+                error!("[PROXY] Failed to accept connection: {}", e);
             }
         }
     }
@@ -370,22 +398,99 @@ fn get_original_dst(socket: &tokio::net::TcpStream) -> Result<SocketAddr> {
 
 #[cfg(target_os = "linux")]
 async fn proxy_connection(mut client: tokio::net::TcpStream, target: SocketAddr) -> Result<()> {
+    use tokio::time::{timeout, Duration, Instant};
 
-    match tokio::net::TcpStream::connect(target).await {
-        Ok(mut server) => {
+    let start_time = Instant::now();
+    info!("[PROXY] Starting connection to {}", target);
+
+    // Set connection timeout and read/write timeouts
+    let connect_timeout = Duration::from_secs(10);
+    let io_timeout = Duration::from_secs(300); // 5 minutes idle timeout
+
+    client.set_nodelay(true)?;
+
+    match timeout(connect_timeout, tokio::net::TcpStream::connect(target)).await {
+        Ok(Ok(mut server)) => {
+            server.set_nodelay(true)?;
+            let connect_duration = start_time.elapsed();
+            info!("[PROXY] Connected to {} in {:?}", target, connect_duration);
+
             let (mut client_read, mut client_write) = client.split();
             let (mut server_read, mut server_write) = server.split();
 
-            let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
-            let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
+            let client_addr = client.peer_addr().ok();
+            let mut bytes_c2s: u64 = 0;
+            let mut bytes_s2c: u64 = 0;
+
+            // Use timeout for data transfer
+            let client_to_server = async {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match timeout(io_timeout, client_read.read(&mut buf)).await {
+                        Ok(Ok(0)) => {
+                            debug!("[PROXY] Client {} closed connection", client_addr.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string()));
+                            break;
+                        }
+                        Ok(Ok(n)) => {
+                            bytes_c2s += n as u64;
+                            if server_write.write_all(&buf[..n]).await.is_err() {
+                                warn!("[PROXY] Failed to write to server {}", target);
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            debug!("[PROXY] Client read error: {}", e);
+                            break;
+                        }
+                        Err(_) => {
+                            debug!("[PROXY] Client read timeout");
+                            break; // Timeout
+                        }
+                    }
+                }
+            };
+
+            let server_to_client = async {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match timeout(io_timeout, server_read.read(&mut buf)).await {
+                        Ok(Ok(0)) => {
+                            debug!("[PROXY] Server {} closed connection", target);
+                            break;
+                        }
+                        Ok(Ok(n)) => {
+                            bytes_s2c += n as u64;
+                            if client_write.write_all(&buf[..n]).await.is_err() {
+                                warn!("[PROXY] Failed to write to client {:?}", client_addr);
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            debug!("[PROXY] Server read error: {}", e);
+                            break;
+                        }
+                        Err(_) => {
+                            debug!("[PROXY] Server read timeout");
+                            break; // Timeout
+                        }
+                    }
+                }
+            };
 
             tokio::select! {
-                res = client_to_server => { if let Err(e) = res { debug!("Client to server error: {}", e); } }
-                res = server_to_client => { if let Err(e) = res { debug!("Server to client error: {}", e); } }
+                _ = client_to_server => {}
+                _ = server_to_client => {}
             }
+
+            let total_duration = start_time.elapsed();
+            info!("[PROXY] Connection to {} closed - C2S: {} bytes, S2C: {} bytes, Duration: {:?}",
+                  target, bytes_c2s, bytes_s2c, total_duration);
         }
-        Err(e) => {
-            error!("Failed to connect to target {}: {}", target, e);
+        Ok(Err(e)) => {
+            error!("[PROXY] Failed to connect to target {}: {} (type: {})", target, e, e.kind());
+        }
+        Err(_) => {
+            error!("[PROXY] Connection timeout to {} after {:?}", target, connect_timeout);
         }
     }
     Ok(())
