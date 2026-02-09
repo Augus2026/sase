@@ -354,7 +354,7 @@ fn get_original_dst(socket: &tokio::net::TcpStream) -> Result<SocketAddr> {
             return Err(anyhow::anyhow!("Failed to get original destination"));
         }
 
-        if addr.ss_family == libc::AF_INET {
+        if addr.ss_family == libc::AF_INET as u16 {
             let addr_in = &addr as *const libc::sockaddr_storage as *const libc::sockaddr_in;
             let ip = Ipv4Addr::from((*addr_in).sin_addr.s_addr.to_be());
             let port = u16::from_be((*addr_in).sin_port);
