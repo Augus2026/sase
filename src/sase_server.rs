@@ -275,9 +275,11 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
     // Start transparent proxy if enabled
     let proxy_handle = if config.transparent_proxy.enabled {
-        info!("Transparent proxy enabled on port {}", config.transparent_proxy.redirect_port);
+        info!("Transparent proxy enabled on port {} for interface {}",
+              config.transparent_proxy.redirect_port, config.transparent_proxy.tun_interface);
+        let server_config = config.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = start_transparent_proxy(config.transparent_proxy).await {
+            if let Err(e) = start_transparent_proxy(server_config.transparent_proxy, server_config).await {
                 error!("Transparent proxy error: {}", e);
             }
         }))
@@ -301,12 +303,12 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
 /// Start transparent proxy with iptables redirection (Linux only)
 #[cfg(target_os = "linux")]
-async fn start_transparent_proxy(config: TransparentProxyConfig) -> Result<()> {
+async fn start_transparent_proxy(config: TransparentProxyConfig, server_config: ServerConfig) -> Result<()> {
     use tokio::net::TcpListener;
 
     // Setup iptables for transparent proxying
     info!("Setting up iptables for transparent proxy...");
-    setup_iptables_rules(&config).await?;
+    setup_iptables_rules(&server_config).await?;
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", config.redirect_port)).await?;
     info!("Transparent proxy listening on port {}", config.redirect_port);
@@ -389,16 +391,18 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, target: SocketAddr)
 }
 
 #[cfg(target_os = "linux")]
-async fn setup_iptables_rules(config: &TransparentProxyConfig) -> Result<()> {
+async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
     use tokio::process::Command;
+
+    let tun_if = &config.transparent_proxy.tun_interface;
+    let proxy_port = config.transparent_proxy.redirect_port;
 
     // Enable IP forwarding
     tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
 
     // Flush existing rules and remove chain before adding new ones
     let cleanup_commands = vec![
-        "-t nat -D OUTPUT -j SASE_PROXY",
-        "-t nat -D PREROUTING -j SASE_PROXY",
+        format!("-t nat -D PREROUTING -i {} -j SASE_PROXY", tun_if),
         "-t nat -F SASE_PROXY",
         "-t nat -X SASE_PROXY",
     ];
@@ -412,15 +416,17 @@ async fn setup_iptables_rules(config: &TransparentProxyConfig) -> Result<()> {
         // Ignore errors during cleanup (rules might not exist)
     }
 
-    // Create iptables chain and add rules
-    let redirect_rule = format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", config.redirect_port);
+    // Create iptables chain and add rules - ONLY for TUN interface traffic
+    let redirect_rule = format!("-t nat -A SASE_PROXY -p tcp -j REDIRECT --to-ports {}", proxy_port);
+    let tun_network = format!("{}/24", config.tun_addr);
     let setup_commands = vec![
         "-t nat -N SASE_PROXY",
-        "-t nat -A SASE_PROXY -o lo -j RETURN",
-        "-t nat -A SASE_PROXY -d 10.0.0.0/24 -j RETURN",
+        // Skip traffic to VPN network (don't proxy connections to VPN IPs)
+        format!("-t nat -A SASE_PROXY -d {} -j RETURN", tun_network).as_str(),
+        // Redirect all other TCP traffic
         redirect_rule.as_str(),
-        "-t nat -A OUTPUT -j SASE_PROXY",
-        "-t nat -A PREROUTING -j SASE_PROXY",
+        // Only apply to traffic coming from TUN interface (not OUTPUT or physical interfaces)
+        format!("-t nat -A PREROUTING -i {} -p tcp -j SASE_PROXY", tun_if).as_str(),
     ];
 
     for cmd in setup_commands {
@@ -437,7 +443,7 @@ async fn setup_iptables_rules(config: &TransparentProxyConfig) -> Result<()> {
         }
     }
 
-    info!("iptables rules configured");
+    info!("iptables rules configured for TUN interface {} only", tun_if);
     Ok(())
 }
 
@@ -494,6 +500,8 @@ pub async fn run_server_with_args(
     if let Some(port) = proxy_port {
         config.transparent_proxy.redirect_port = port;
     }
+    // Set TUN interface name for transparent proxy
+    config.transparent_proxy.tun_interface = config.tun_name.clone();
 
     debug!("Server configuration: {:?}", config);
 

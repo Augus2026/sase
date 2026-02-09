@@ -305,6 +305,7 @@ pub async fn tun_io_task(
 pub struct TransparentProxyConfig {
     pub enabled: bool,
     pub redirect_port: u16,
+    pub tun_interface: String,
 }
 
 impl Default for TransparentProxyConfig {
@@ -312,6 +313,7 @@ impl Default for TransparentProxyConfig {
         Self {
             enabled: false,
             redirect_port: 1080,
+            tun_interface: "tun0".to_string(),
         }
     }
 }
