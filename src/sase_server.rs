@@ -273,41 +273,14 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         )
     );
 
-    // Start transparent proxy if enabled
-    let proxy_handle = if config.transparent_proxy.enabled {
-        let proxy_mode = config.transparent_proxy.mode;
-        info!("Transparent proxy enabled: mode={}, port={}, interface={}",
-              proxy_mode, config.transparent_proxy.redirect_port, config.transparent_proxy.tun_interface);
-
-        let server_config = config.clone();
-        Some(tokio::spawn(async move {
-            let result = match proxy_mode {
-                crate::common::ProxyMode::Nat => {
-                    crate::proxy_nat::start_nat_proxy(&server_config).await
-                }
-                crate::common::ProxyMode::Redirect => {
-                    crate::proxy_redirect::start_redirect_proxy(&server_config).await
-                }
-            };
-
-            if let Err(e) = result {
-                error!("Transparent proxy error: {}", e);
-            }
-        }))
-    } else {
-        None
-    };
-
     info!("Server ready, waiting for client connections...");
+    info!("For transparent proxy, run: sudo ./proxy_nat.sh");
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down server...");
 
     tun_handle.abort();
     udp_handle.abort();
-    if let Some(handle) = proxy_handle {
-        handle.abort();
-    }
 
     Ok(())
 }
@@ -321,9 +294,6 @@ pub async fn run_server_with_args(
     mtu: Option<usize>,
     recv_buffer: Option<usize>,
     send_buffer: Option<usize>,
-    transparent_proxy: bool,
-    proxy_mode: Option<String>,
-    proxy_port: Option<u16>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
 
@@ -354,17 +324,6 @@ pub async fn run_server_with_args(
     if let Some(send_buffer_mb) = send_buffer {
         config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
     }
-
-    // Configure transparent proxy
-    config.transparent_proxy.enabled = transparent_proxy;
-    if let Some(mode_str) = proxy_mode {
-        config.transparent_proxy.mode = mode_str.parse()?;
-    }
-    if let Some(port) = proxy_port {
-        config.transparent_proxy.redirect_port = port;
-    }
-    // Set TUN interface name for transparent proxy
-    config.transparent_proxy.tun_interface = config.tun_name.clone();
 
     debug!("Server configuration: {:?}", config);
 

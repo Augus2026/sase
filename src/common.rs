@@ -133,7 +133,6 @@ pub struct ServerConfig {
     pub mtu: usize,
     pub socket_recv_buffer_size: usize,
     pub socket_send_buffer_size: usize,
-    pub transparent_proxy: TransparentProxyConfig,
 }
 
 impl Default for ServerConfig {
@@ -146,7 +145,6 @@ impl Default for ServerConfig {
             mtu: TUN_MTU,
             socket_recv_buffer_size: 8 * 1024 * 1024,
             socket_send_buffer_size: 8 * 1024 * 1024,
-            transparent_proxy: TransparentProxyConfig::default(),
         }
     }
 }
@@ -300,58 +298,3 @@ pub async fn tun_io_task(
     }
 }
 
-/// Transparent proxy mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyMode {
-    /// NAT/MASQUERADE mode - kernel handles forwarding
-    Nat,
-    /// REDIRECT mode - application layer proxy
-    Redirect,
-}
-
-impl Default for ProxyMode {
-    fn default() -> Self {
-        Self::Nat
-    }
-}
-
-impl std::str::FromStr for ProxyMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "nat" => Ok(Self::Nat),
-            "redirect" => Ok(Self::Redirect),
-            _ => anyhow::bail!("Invalid proxy mode: {}. Valid options: nat, redirect", s),
-        }
-    }
-}
-
-impl std::fmt::Display for ProxyMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Nat => write!(f, "nat"),
-            Self::Redirect => write!(f, "redirect"),
-        }
-    }
-}
-
-/// Transparent proxy configuration
-#[derive(Debug, Clone)]
-pub struct TransparentProxyConfig {
-    pub enabled: bool,
-    pub mode: ProxyMode,
-    pub redirect_port: u16,
-    pub tun_interface: String,
-}
-
-impl Default for TransparentProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: ProxyMode::Nat,
-            redirect_port: 1080,
-            tun_interface: "tun0".to_string(),
-        }
-    }
-}

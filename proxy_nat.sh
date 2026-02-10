@@ -1,83 +1,97 @@
 #!/bin/bash
-# tun2internet_smart.sh
+# proxy_nat.sh - TUN to Internet NAT proxy
+# Simple script to enable TUN device traffic to access Internet via NAT
 
-# 配置变量
+set -e
+
+# Default values
 TUN_DEV="tun0"
-TUN_IP="10.0.0.1"
 TUN_NET="10.0.0.0/24"
-PHY_DEV="eth0"
-PHY_GW="192.168.1.1"  # 物理网卡的网关
+PHY_DEV=""
+PHY_GW=""
 
-# 1. 启用IP转发
+# Usage
+usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Configure TUN device to access Internet with NAT."
+    echo ""
+    echo "OPTIONS:"
+    echo "  -t, --tun-dev NAME       TUN device name (default: tun0)"
+    echo "  -n, --tun-net CIDR       TUN network CIDR (default: 10.0.0.0/24)"
+    echo "  -p, --phy-dev NAME       Physical interface (auto-detect if not specified)"
+    echo "  -g, --phy-gateway IP     Physical gateway (auto-detect if not specified)"
+    echo "  -c, --cleanup            Clean up rules and exit"
+    echo "  -h, --help               Show this help"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  $0                      # Auto-detect physical interface"
+    echo "  $0 -p ens33 -g 192.168.1.1"
+    echo "  $0 -c                   # Cleanup rules"
+    exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -t|--tun-dev) TUN_DEV="$2"; shift 2 ;;
+        -n|--tun-net) TUN_NET="$2"; shift 2 ;;
+        -p|--phy-dev) PHY_DEV="$2"; shift 2 ;;
+        -g|--phy-gateway) PHY_GW="$2"; shift 2 ;;
+        -c|--cleanup)
+            echo "Cleaning up rules..."
+            ip rule del from ${TUN_NET} lookup 100 2>/dev/null || true
+            ip route flush table 100 2>/dev/null || true
+            iptables -D FORWARD -i ${TUN_DEV} -o ${PHY_DEV:-eth0} -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i ${PHY_DEV:-eth0} -o ${TUN_DEV} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            iptables -t nat -D POSTROUTING -s ${TUN_NET} -o ${PHY_DEV:-eth0} -j MASQUERADE 2>/dev/null || true
+            echo "Cleanup complete"
+            exit 0
+            ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+# Auto-detect physical interface
+if [ -z "$PHY_DEV" ]; then
+    PHY_DEV=$(ip route | grep default | head -n1 | sed 's/.*dev \([^ ]*\).*/\1/')
+    echo "Auto-detected physical interface: $PHY_DEV"
+fi
+
+# Auto-detect gateway
+if [ -z "$PHY_GW" ]; then
+    PHY_GW=$(ip route | grep default | grep "dev $PHY_DEV" | head -n1 | sed 's/.*via \([^ ]*\).*/\1/')
+    echo "Auto-detected gateway: $PHY_GW"
+fi
+
+echo "=== Configuration ==="
+echo "TUN Device: $TUN_DEV"
+echo "TUN Network: $TUN_NET"
+echo "Physical Device: $PHY_DEV"
+echo "Gateway: $PHY_GW"
+echo "====================="
+
+# Enable IP forwarding
+echo "Enabling IP forwarding..."
 echo 1 > /proc/sys/net/ipv4/ip_forward
-sysctl -w net.ipv4.ip_forward=1
 
-# 2. 清理规则（保留现有连接）
-iptables -F
-iptables -t nat -F
-iptables -t mangle -F
-iptables -X
-iptables -t nat -X
-iptables -t mangle -X
+# Clean up existing rules
+ip rule del from ${TUN_NET} lookup 100 2>/dev/null || true
+ip route flush table 100 2>/dev/null || true
 
-# 3. 设置默认策略
-iptables -P INPUT ACCEPT
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
-
-# 4. 配置路由策略（关键！）
-echo "配置智能路由..."
-
-# 添加默认路由到物理网卡（互联网）
+# Configure routing
+echo "Configuring routing..."
 ip route add default via ${PHY_GW} dev ${PHY_DEV} table 100
+ip rule add from ${TUN_NET} lookup 100
 
-# 添加内网路由到 TUN 设备
-ip route add 10.0.0.0/8 dev ${TUN_DEV} table 100
-ip route add 172.16.0.0/12 dev ${TUN_DEV} table 100
-ip route add 192.168.0.0/16 dev ${TUN_DEV} table 100
-
-# 添加路由规则：来自 TUN 的流量使用新路由表
-ip rule add from ${TUN_NET} lookup 100 priority 1000
-
-# 5. 配置iptables转发
-# 允许 TUN 到物理网卡
+# Configure iptables
+echo "Configuring iptables..."
 iptables -A FORWARD -i ${TUN_DEV} -o ${PHY_DEV} -j ACCEPT
-# 允许回复
 iptables -A FORWARD -i ${PHY_DEV} -o ${TUN_DEV} -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -t nat -A POSTROUTING -s ${TUN_NET} -o ${PHY_DEV} -j MASQUERADE
 
-# 6. 配置智能 NAT
-# 使用 ipset 管理内网网段
-apt-get install -y ipset 2>/dev/null || yum install -y ipset 2>/dev/null
-ipset create LOCAL_NETS hash:net 2>/dev/null || ipset flush LOCAL_NETS
-ipset add LOCAL_NETS 10.0.0.0/8
-ipset add LOCAL_NETS 172.16.0.0/12
-ipset add LOCAL_NETS 192.168.0.0/16
-ipset add LOCAL_NETS 169.254.0.0/16
-
-# 只有访问非内网地址时才进行 NAT
-iptables -t nat -A POSTROUTING -s ${TUN_NET} -o ${PHY_DEV} \
-    -m set ! --match-set LOCAL_NETS dst \
-    -j MASQUERADE
-
-# 7. 允许 TUN 设备间的通信（可选）
-iptables -A FORWARD -i ${TUN_DEV} -o ${TUN_DEV} -j ACCEPT
-
-# 8. 设置 MSS 钳制（优化 MTU）
-iptables -t mangle -A FORWARD -o ${PHY_DEV} -p tcp --tcp-flags SYN,RST SYN \
-    -j TCPMSS --clamp-mss-to-pmtu
-
-echo "========================================="
-echo "配置完成！"
-echo "TUN 设备: ${TUN_DEV} (${TUN_IP})"
-echo "物理设备: ${PHY_DEV}"
-echo "内网网段（不走 NAT）:"
-echo "  10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
-echo "========================================="
-
-# 测试配置
-echo "测试配置..."
-echo "1. 检查路由表:"
-ip route show table 100
 echo ""
-echo "2. 检查 NAT 规则:"
-iptables -t nat -L POSTROUTING -n -v
+echo "=== Configuration Complete ==="
+echo "Traffic from $TUN_NET can now access Internet via $PHY_DEV"
+echo "To cleanup: $0 -c"

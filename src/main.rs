@@ -1,8 +1,6 @@
 mod sase_client;
 mod sase_server;
 mod common;
-mod proxy_nat;
-mod proxy_redirect;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -48,18 +46,6 @@ enum Commands {
         /// Socket send buffer size in MB (default: 2)
         #[arg(long)]
         send_buffer: Option<usize>,
-
-        /// Enable transparent proxy mode (Linux only)
-        #[arg(long)]
-        transparent_proxy: bool,
-
-        /// Transparent proxy mode: nat or redirect (default: nat)
-        #[arg(long, value_name = "MODE")]
-        proxy_mode: Option<String>,
-
-        /// Transparent proxy redirect port (default: 1080, only for redirect mode)
-        #[arg(long)]
-        proxy_port: Option<u16>,
 
         /// Verbose logging
         #[arg(short, long)]
@@ -114,9 +100,6 @@ async fn main() -> Result<()> {
             mtu,
             recv_buffer,
             send_buffer,
-            transparent_proxy,
-            proxy_mode,
-            proxy_port,
             verbose,
         } => {
             env_logger::Builder::from_env(
@@ -125,10 +108,7 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Server");
-            if transparent_proxy {
-                info!("Transparent proxy mode enabled");
-            }
-            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer, transparent_proxy, proxy_mode, proxy_port).await
+            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer).await
         }
         Commands::Client {
             server,
