@@ -1,6 +1,8 @@
 mod sase_client;
 mod sase_server;
 mod common;
+mod proxy_nat;
+mod proxy_redirect;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -51,7 +53,11 @@ enum Commands {
         #[arg(long)]
         transparent_proxy: bool,
 
-        /// Transparent proxy redirect port (default: 1080)
+        /// Transparent proxy mode: nat or redirect (default: nat)
+        #[arg(long, value_name = "MODE")]
+        proxy_mode: Option<String>,
+
+        /// Transparent proxy redirect port (default: 1080, only for redirect mode)
         #[arg(long)]
         proxy_port: Option<u16>,
 
@@ -109,6 +115,7 @@ async fn main() -> Result<()> {
             recv_buffer,
             send_buffer,
             transparent_proxy,
+            proxy_mode,
             proxy_port,
             verbose,
         } => {
@@ -121,7 +128,7 @@ async fn main() -> Result<()> {
             if transparent_proxy {
                 info!("Transparent proxy mode enabled");
             }
-            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer, transparent_proxy, proxy_port).await
+            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer, transparent_proxy, proxy_mode, proxy_port).await
         }
         Commands::Client {
             server,

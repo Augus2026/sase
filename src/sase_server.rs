@@ -1,4 +1,4 @@
-use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket, TransparentProxyConfig};
+use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -275,12 +275,22 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
     // Start transparent proxy if enabled
     let proxy_handle = if config.transparent_proxy.enabled {
-        info!("Transparent proxy enabled on port {} for interface {}",
-              config.transparent_proxy.redirect_port, config.transparent_proxy.tun_interface);
+        let proxy_mode = config.transparent_proxy.mode;
+        info!("Transparent proxy enabled: mode={}, port={}, interface={}",
+              proxy_mode, config.transparent_proxy.redirect_port, config.transparent_proxy.tun_interface);
+
         let server_config = config.clone();
-        let proxy_config = server_config.transparent_proxy.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = start_transparent_proxy(proxy_config, server_config).await {
+            let result = match proxy_mode {
+                crate::common::ProxyMode::Nat => {
+                    crate::proxy_nat::start_nat_proxy(&server_config).await
+                }
+                crate::common::ProxyMode::Redirect => {
+                    crate::proxy_redirect::start_redirect_proxy(&server_config).await
+                }
+            };
+
+            if let Err(e) = result {
                 error!("Transparent proxy error: {}", e);
             }
         }))
@@ -302,144 +312,6 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Start transparent proxy with iptables redirection (Linux only)
-#[cfg(target_os = "linux")]
-async fn start_transparent_proxy(config: TransparentProxyConfig, server_config: ServerConfig) -> Result<()> {
-    use tokio::time::{sleep, Duration};
-
-    // Setup iptables for transparent proxying
-    info!("[PROXY] Setting up iptables for NAT on interface {}...", server_config.transparent_proxy.tun_interface);
-    setup_iptables_rules(&server_config).await?;
-
-    info!("[PROXY] NAT mode enabled - TUN traffic will be MASQUERADE'd to physical interface");
-    info!("[PROXY] Kernel will handle packet forwarding, no TCP proxy needed");
-
-    // Keep the task alive but do nothing - kernel handles the forwarding
-    loop {
-        sleep(Duration::from_secs(60)).await;
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn get_original_dst(socket: &tokio::net::TcpStream) -> Result<SocketAddr> {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = socket.as_raw_fd();
-    unsafe {
-        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-        let ret = libc::getsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
-            &mut addr as *mut _ as *mut libc::c_void,
-            &mut len as *mut libc::socklen_t,
-        );
-
-        if ret != 0 {
-            return Err(anyhow::anyhow!("Failed to get original destination"));
-        }
-
-        if addr.ss_family == libc::AF_INET as u16 {
-            let addr_in = &addr as *const libc::sockaddr_storage as *const libc::sockaddr_in;
-            let ip = Ipv4Addr::from((*addr_in).sin_addr.s_addr.to_be());
-            let port = u16::from_be((*addr_in).sin_port);
-            Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
-        } else {
-            anyhow::bail!("Only IPv4 is supported");
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn proxy_connection(mut client: tokio::net::TcpStream, target: SocketAddr) -> Result<()> {
-
-    match tokio::net::TcpStream::connect(target).await {
-        Ok(mut server) => {
-            let (mut client_read, mut client_write) = client.split();
-            let (mut server_read, mut server_write) = server.split();
-
-            let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
-            let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
-
-            tokio::select! {
-                res = client_to_server => { if let Err(e) = res { debug!("Client to server error: {}", e); } }
-                res = server_to_client => { if let Err(e) = res { debug!("Server to client error: {}", e); } }
-            }
-        }
-        Err(e) => {
-            error!("Failed to connect to target {}: {}", target, e);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn setup_iptables_rules(config: &ServerConfig) -> Result<()> {
-    use tokio::process::Command;
-
-    let tun_if = &config.transparent_proxy.tun_interface;
-
-    // Get physical interface (first non-lo interface)
-    let physical_if = "ens33"; // TODO: Make this configurable
-
-    // Enable IP forwarding
-    tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await?;
-
-    // Flush existing rules
-    let cleanup_commands: Vec<String> = vec![
-        format!("-t nat -D POSTROUTING -o {} -j MASQUERADE", physical_if),
-        format!("-t filter -D FORWARD -i {} -j ACCEPT", tun_if),
-        format!("-t filter -D FORWARD -o {} -j ACCEPT", tun_if),
-    ];
-
-    for cmd in cleanup_commands {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let _ = Command::new("iptables")
-            .args(&parts)
-            .output()
-            .await;
-    }
-
-    // Setup NAT and forwarding rules
-    let setup_commands: Vec<String> = vec![
-        // Allow forwarding from TUN to physical interface
-        format!("-t filter -A FORWARD -i {} -o {} -j ACCEPT", tun_if, physical_if),
-        format!("-t filter -A FORWARD -o {} -i {} -j ACCEPT", tun_if, physical_if),
-        // MASQUERADE traffic going out to physical interface
-        format!("-t nat -A POSTROUTING -o {} -j MASQUERADE", physical_if),
-    ];
-
-    for cmd in setup_commands {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let result = Command::new("iptables")
-            .args(&parts)
-            .output()
-            .await;
-
-        if let Ok(output) = result {
-            if !output.status.success() {
-                warn!("iptables command failed: {}", cmd);
-            }
-        }
-    }
-
-    info!("iptables rules configured: TUN {} <-> Physical {} with MASQUERADE", tun_if, physical_if);
-    Ok(())
-}
-
-// Stub implementations for non-Linux platforms
-#[cfg(not(target_os = "linux"))]
-async fn start_transparent_proxy(_config: TransparentProxyConfig, _server_config: ServerConfig) -> Result<()> {
-    info!("Transparent proxy is only supported on Linux");
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn setup_iptables_rules(_config: &ServerConfig) -> Result<()> {
-    Ok(())
-}
 
 pub async fn run_server_with_args(
     bind: Option<String>,
@@ -450,6 +322,7 @@ pub async fn run_server_with_args(
     recv_buffer: Option<usize>,
     send_buffer: Option<usize>,
     transparent_proxy: bool,
+    proxy_mode: Option<String>,
     proxy_port: Option<u16>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
@@ -484,6 +357,9 @@ pub async fn run_server_with_args(
 
     // Configure transparent proxy
     config.transparent_proxy.enabled = transparent_proxy;
+    if let Some(mode_str) = proxy_mode {
+        config.transparent_proxy.mode = mode_str.parse()?;
+    }
     if let Some(port) = proxy_port {
         config.transparent_proxy.redirect_port = port;
     }
