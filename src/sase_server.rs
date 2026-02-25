@@ -250,21 +250,17 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
         .up();
     let tun = create_as_async(&tun_config)?;
 
-    let transport: Arc<dyn Transport> = match transport_type.to_lowercase().as_str() {
-        "tcp" => {
-            info!("Using TCP transport");
-            let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-            info!("TCP server listening on {}", config.bind_addr);
-            Arc::new(TcpTransport::new(listener))
-        }
-        "udp" | _ => {
-            info!("Using UDP transport");
-            let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
-            std_socket.set_nonblocking(true)?;
-            let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
-            Arc::new(udp_transport)
-        }
-    };
+    // For TCP, we need to handle connections differently
+    if transport_type.to_lowercase().as_str() == "tcp" {
+        info!("Using TCP transport");
+        return run_tcp_server(config, tun).await;
+    }
+
+    // UDP server (original logic)
+    let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
+    std_socket.set_nonblocking(true)?;
+    let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+    let transport: Arc<dyn Transport> = Arc::new(udp_transport);
 
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -286,6 +282,53 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
     );
 
     info!("Server ready, waiting for client connections...");
+    info!("For transparent proxy, run: sudo ./proxy_nat.sh");
+
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down server...");
+
+    tun_handle.abort();
+    transport_handle.abort();
+
+    Ok(())
+}
+
+/// TCP-specific server implementation
+/// TCP requires accepting connections before handling data
+async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    info!("TCP server listening on {}", config.bind_addr);
+
+    let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
+
+    let tun_handle = tokio::spawn(
+        tun_io_task(
+            tun,
+            tun_to_transport_tx,
+            transport_to_tun_rx
+        )
+    );
+
+    info!("Server ready, waiting for TCP client connections...");
+
+    // Accept first TCP connection
+    let (stream, addr) = listener.accept().await?;
+    info!("TCP connection accepted from {}", addr);
+
+    let tcp_transport = TcpTransport::from_accepted_stream(stream, addr);
+    let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
+
+    let transport_handle = tokio::spawn(
+        transport_io_task(
+            Arc::clone(&transport),
+            Arc::clone(&clients),
+            tun_to_transport_rx,
+            transport_to_tun_tx
+        )
+    );
+
     info!("For transparent proxy, run: sudo ./proxy_nat.sh");
 
     tokio::signal::ctrl_c().await?;

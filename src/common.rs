@@ -355,6 +355,17 @@ impl TcpTransport {
         Ok(transport)
     }
 
+    /// Create a TcpTransport from an accepted stream (for server-side)
+    pub fn from_accepted_stream(stream: TcpStream, addr: SocketAddr) -> Self {
+        info!("Creating TcpTransport from accepted stream, remote addr: {}", addr);
+        Self {
+            listener: None,
+            stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+            remote_addr: Arc::new(tokio::sync::Mutex::new(Some(addr))),
+            read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+
     /// Helper function to read exactly n bytes from stream
     async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
         let mut pos = 0;
@@ -386,9 +397,20 @@ impl Transport for TcpTransport {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        debug!("TcpTransport::recv_from called");
+
         let remote_addr = {
             let remote_addr_guard = self.remote_addr.lock().await;
-            *remote_addr_guard.as_ref().ok_or_else(|| anyhow::anyhow!("No remote address stored"))?
+            match remote_addr_guard.as_ref() {
+                Some(addr) => {
+                    debug!("Remote address found: {}", addr);
+                    *addr
+                }
+                None => {
+                    error!("No remote address stored in TcpTransport");
+                    anyhow::bail!("No remote address stored");
+                }
+            }
         };
 
         // Helper function to read one byte

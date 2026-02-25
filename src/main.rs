@@ -24,11 +24,11 @@ enum Commands {
         bind: Option<String>,
 
         /// TUN device name (default: tun0)
-        #[arg(short, long)]
+        #[arg(short = 'u', long)]
         tun: Option<String>,
 
         /// TUN device address (default: 10.0.0.1)
-        #[arg(short, long)]
+        #[arg(short = 'a', long)]
         address: Option<String>,
 
         /// Netmask (default: 255.255.255.0)
@@ -36,7 +36,7 @@ enum Commands {
         netmask: Option<String>,
 
         /// MTU (default: 1500)
-        #[arg(short, long)]
+        #[arg(short = 'm', long)]
         mtu: Option<usize>,
 
         /// Socket receive buffer size in MB (default: 2)
@@ -62,11 +62,11 @@ enum Commands {
         server: Option<String>,
 
         /// TUN device name (default: tun0)
-        #[arg(short, long)]
+        #[arg(short = 'u', long)]
         tun: Option<String>,
 
         /// TUN device address (default: 10.0.0.2)
-        #[arg(short, long)]
+        #[arg(short = 'a', long)]
         address: Option<String>,
 
         /// Netmask (default: 255.255.255.0)
@@ -74,7 +74,7 @@ enum Commands {
         netmask: Option<String>,
 
         /// MTU (default: 1500)
-        #[arg(short, long)]
+        #[arg(short = 'm', long)]
         mtu: Option<usize>,
 
         /// Socket receive buffer size in MB (default: 2)
