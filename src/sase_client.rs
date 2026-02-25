@@ -1,15 +1,14 @@
-use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, configure_udp_socket};
+use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, Transport, UdpTransport};
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tun2::{create_as_async, Configuration};
 use std::net::UdpSocket as StdUdpSocket;
 
-async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) -> Result<u32> {
+async fn handshake_async(transport: &dyn Transport, server_addr: std::net::SocketAddr) -> Result<u32> {
     info!("Connecting to server at {}", server_addr);
 
     let handshake_packet = VpnPacket::new(PacketType::Handshake, 0, 0, 0);
@@ -23,7 +22,7 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
         attempt += 1;
         info!("Handshake attempt {} to {}", attempt, server_addr);
 
-        socket.send_to(&handshake_buf, server_addr).await?;
+        transport.send_to(&handshake_buf, server_addr).await?;
         info!("Handshake sent to {}", server_addr);
 
         let timeout = sleep(Duration::from_secs(5));
@@ -32,7 +31,7 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
         let mut recv_buf = [0u8; VpnPacket::HEADER_SIZE];
 
         tokio::select! {
-            result = socket.recv_from(&mut recv_buf) => {
+            result = transport.recv_from(&mut recv_buf) => {
                 match result {
                     Ok((n, addr)) => {
                         if addr == server_addr {
@@ -64,7 +63,7 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
 }
 
 async fn udp_io_task(
-    socket: Arc<UdpSocket>,
+    transport: Arc<dyn Transport>,
     server_addr: std::net::SocketAddr,
     client_id: u32,
     mut tun_rx: mpsc::Receiver<Vec<u8>>,
@@ -77,7 +76,7 @@ async fn udp_io_task(
 
     loop {
         tokio::select! {
-            result = socket.recv_from(&mut udp_buf) => {
+            result = transport.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((n, src_addr)) => {
                         if src_addr != server_addr {
@@ -141,7 +140,7 @@ async fn udp_io_task(
                         send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
                         send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
-                        if let Err(e) = socket.send_to(&send_buf, server_addr).await {
+                        if let Err(e) = transport.send_to(&send_buf, server_addr).await {
                             warn!("UDP: Failed to send to server: {}", e);
                         }
                     }
@@ -157,7 +156,7 @@ async fn udp_io_task(
                 sequence = sequence.wrapping_add(1);
                 let buf = packet.to_bytes();
 
-                if let Err(e) = socket.send_to(&buf, server_addr).await {
+                if let Err(e) = transport.send_to(&buf, server_addr).await {
                     warn!("Keepalive: Failed to send: {}", e);
                 }
             }
@@ -183,9 +182,10 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
     std_socket.set_nonblocking(true)?;
 
-    let socket = configure_udp_socket(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+    let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+    let transport: Arc<dyn Transport> = Arc::new(udp_transport);
 
-    let client_id = handshake_async(&socket, config.server_addr).await?;
+    let client_id = handshake_async(transport.as_ref(), config.server_addr).await?;
     info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);
 
     let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(4096);
@@ -200,7 +200,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     );
     let udp_handle = tokio::spawn(
         udp_io_task(
-            Arc::clone(&socket),
+            Arc::clone(&transport),
             config.server_addr,
             client_id,
             tun_to_udp_rx,

@@ -1,10 +1,9 @@
-use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, configure_udp_socket};
+use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, Transport, UdpTransport};
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
 use std::net::UdpSocket as StdUdpSocket;
@@ -19,7 +18,7 @@ struct Client {
 
 async fn handle_handshake(
     src_addr: SocketAddr,
-    socket: &UdpSocket,
+    transport: &dyn Transport,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     next_client_id: &mut u32,
 ) {
@@ -52,7 +51,7 @@ async fn handle_handshake(
             0,
         );
         let response_buf = response.to_bytes();
-        if let Err(e) = socket.send_to(&response_buf, src_addr).await {
+        if let Err(e) = transport.send_to(&response_buf, src_addr).await {
             error!("Failed to send handshake to {}: {}", src_addr, e);
         }
 
@@ -88,7 +87,7 @@ async fn handle_data(
 async fn handle_keepalive(
     header: &VpnPacket,
     src_addr: SocketAddr,
-    socket: &UdpSocket,
+    transport: &dyn Transport,
 ) {
     info!("Keepalive received from client {}", header.client_id);
     let response = VpnPacket::new(
@@ -98,7 +97,7 @@ async fn handle_keepalive(
         0,
     );
     let response_buf = response.to_bytes();
-    if let Err(e) = socket.send_to(&response_buf, src_addr).await {
+    if let Err(e) = transport.send_to(&response_buf, src_addr).await {
         warn!("Failed to send keepalive response to {}: {}", src_addr, e);
     }
 }
@@ -130,7 +129,7 @@ fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
 
 async fn send_to_client(
     data: &[u8],
-    socket: &UdpSocket,
+    transport: &dyn Transport,
     client: &Client,
 ) {
     let packet = VpnPacket::new(
@@ -145,7 +144,7 @@ async fn send_to_client(
     send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
     print_packet_info("[udp write]", &send_buf);
-    if let Err(e) = socket.send_to(&send_buf, client.addr).await {
+    if let Err(e) = transport.send_to(&send_buf, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
     }
 }
@@ -154,20 +153,20 @@ async fn handle_message(
     header: VpnPacket,
     data: &[u8],
     src_addr: SocketAddr,
-    socket: &UdpSocket,
+    transport: &dyn Transport,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     next_client_id: &mut u32,
     tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     match header.packet_type {
         PacketType::Handshake => {
-            handle_handshake(src_addr, socket, clients, next_client_id).await;
+            handle_handshake(src_addr, transport, clients, next_client_id).await;
         }
         PacketType::Data => {
             handle_data(&header, data, tun_tx).await;
         }
         PacketType::KeepAlive => {
-            handle_keepalive(&header, src_addr, socket).await;
+            handle_keepalive(&header, src_addr, transport).await;
         }
         PacketType::Disconnect => {
             handle_disconnect(&header, clients).await;
@@ -176,7 +175,7 @@ async fn handle_message(
 }
 
 async fn udp_io_task(
-    socket: Arc<UdpSocket>,
+    transport: Arc<dyn Transport>,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
     mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -187,7 +186,7 @@ async fn udp_io_task(
 
     loop {
         tokio::select! {
-            result = socket.recv_from(&mut udp_buf) => {
+            result = transport.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((n, src_addr)) => {
                         if n < VpnPacket::HEADER_SIZE {
@@ -201,7 +200,7 @@ async fn udp_io_task(
                                     header,
                                     &udp_buf[..n],
                                     src_addr,
-                                    &socket,
+                                    transport.as_ref(),
                                     &clients,
                                     &mut next_client_id,
                                     &tun_tx,
@@ -226,7 +225,7 @@ async fn udp_io_task(
                         if let Some(dest_ip) = get_destination_ip(&data) {
                             let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
                             if let Some(client) = target_client {
-                                send_to_client(&data, &socket, client).await;
+                                send_to_client(&data, transport.as_ref(), client).await;
                             }
                         }
                     }
@@ -253,7 +252,8 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
     let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
     std_socket.set_nonblocking(true)?;
-    let socket = configure_udp_socket(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+    let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+    let transport: Arc<dyn Transport> = Arc::new(udp_transport);
     let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
@@ -266,7 +266,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     );
     let udp_handle = tokio::spawn(
         udp_io_task(
-            Arc::clone(&socket),
+            Arc::clone(&transport),
             Arc::clone(&clients),
             tun_to_udp_rx,
             udp_to_tun_tx

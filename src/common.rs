@@ -252,6 +252,50 @@ pub fn configure_udp_socket(
     Ok(Arc::new(socket))
 }
 
+/// Transport trait for abstracting different transport layer protocols
+#[async_trait::async_trait]
+pub trait Transport: Send + Sync {
+    /// Send data to a specific address
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> Result<usize>;
+
+    /// Receive data from any address
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
+
+    /// Get the local address of this transport
+    fn local_addr(&self) -> Result<SocketAddr>;
+}
+
+/// UDP Transport implementation
+pub struct UdpTransport {
+    socket: Arc<UdpSocket>,
+}
+
+impl UdpTransport {
+    pub fn new(socket: Arc<UdpSocket>) -> Self {
+        Self { socket }
+    }
+
+    pub fn from_std(std_socket: StdUdpSocket, recv_buffer_size: usize, send_buffer_size: usize) -> Result<Self> {
+        let socket = configure_udp_socket(std_socket, recv_buffer_size, send_buffer_size)?;
+        Ok(Self { socket })
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for UdpTransport {
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> Result<usize> {
+        self.socket.send_to(buf, addr).await.map_err(Into::into)
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await.map_err(Into::into)
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        self.socket.local_addr().map_err(Into::into)
+    }
+}
+
 /// Common TUN I/O task for handling TUN device read/write operations
 pub async fn tun_io_task(
     mut tun: tun2::AsyncDevice,
