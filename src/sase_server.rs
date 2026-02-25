@@ -58,7 +58,7 @@ async fn handle_handshake(
 
         *next_client_id = next_client_id.wrapping_add(1);
     } else {
-        debug!("Handshake from existing client {}", src_addr);
+        info!("Handshake from existing client {}", src_addr);
     }
 }
 
@@ -90,7 +90,7 @@ async fn handle_keepalive(
     src_addr: SocketAddr,
     socket: &UdpSocket,
 ) {
-    debug!("Keepalive received from client {}", header.client_id);
+    info!("Keepalive received from client {}", header.client_id);
     let response = VpnPacket::new(
         PacketType::KeepAlive,
         header.client_id,
@@ -191,7 +191,7 @@ async fn udp_io_task(
                 match result {
                     Ok((n, src_addr)) => {
                         if n < VpnPacket::HEADER_SIZE {
-                            debug!("UDP: Received short packet from {}", src_addr);
+                            info!("UDP: Received short packet from {}", src_addr);
                             continue;
                         }
 
@@ -208,7 +208,7 @@ async fn udp_io_task(
                                 ).await;
                             }
                             Err(e) => {
-                                debug!("Failed to parse packet from {}: {}", src_addr, e);
+                                info!("Failed to parse packet from {}: {}", src_addr, e);
                             }
                         }
                     }
@@ -285,7 +285,6 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-
 pub async fn run_server_with_args(
     bind: Option<String>,
     tun: Option<String>,
@@ -325,7 +324,7 @@ pub async fn run_server_with_args(
         config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
     }
 
-    debug!("Server configuration: {:?}", config);
+    info!("Server configuration: {:?}", config);
 
     run_server(config).await
 }

@@ -24,7 +24,7 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
         info!("Handshake attempt {} to {}", attempt, server_addr);
 
         socket.send_to(&handshake_buf, server_addr).await?;
-        debug!("Handshake sent to {}", server_addr);
+        info!("Handshake sent to {}", server_addr);
 
         let timeout = sleep(Duration::from_secs(5));
         tokio::pin!(timeout);
@@ -42,18 +42,18 @@ async fn handshake_async(socket: &UdpSocket, server_addr: std::net::SocketAddr) 
                                     return Ok(header.client_id);
                                 }
                                 _ => {
-                                    debug!("Unexpected packet during handshake");
+                                    info!("Unexpected packet during handshake");
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        debug!("Error during handshake attempt {}: {}", attempt, e);
+                        info!("Error during handshake attempt {}: {}", attempt, e);
                     }
                 }
             }
             _ = &mut timeout => {
-                debug!("Handshake attempt {} timed out", attempt);
+                info!("Handshake attempt {} timed out", attempt);
             }
         }
 
@@ -81,12 +81,12 @@ async fn udp_io_task(
                 match result {
                     Ok((n, src_addr)) => {
                         if src_addr != server_addr {
-                            debug!("UDP: Received packet from unexpected address: {}", src_addr);
+                            info!("UDP: Received packet from unexpected address: {}", src_addr);
                             continue;
                         }
 
                         if n < VpnPacket::HEADER_SIZE {
-                            debug!("UDP: Received short packet");
+                            info!("UDP: Received short packet");
                             continue;
                         }
 
@@ -110,7 +110,7 @@ async fn udp_io_task(
                                         }
                                     }
                                     PacketType::KeepAlive => {
-                                        debug!("Keepalive received from server");
+                                        info!("Keepalive received from server");
                                     }
                                     PacketType::Disconnect => {
                                         warn!("Server disconnected");
@@ -120,7 +120,7 @@ async fn udp_io_task(
                                 }
                             }
                             Err(e) => {
-                                debug!("UDP: Failed to parse packet: {}", e);
+                                info!("UDP: Failed to parse packet: {}", e);
                             }
                         }
                     }
@@ -257,7 +257,7 @@ pub async fn run_client_with_args(
         config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
     }
 
-    debug!("Client configuration: {:?}", config);
+    info!("Client configuration: {:?}", config);
 
     run_client(config).await
 }
