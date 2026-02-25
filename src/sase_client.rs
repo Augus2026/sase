@@ -62,34 +62,34 @@ async fn handshake_async(transport: &dyn Transport, server_addr: std::net::Socke
     }
 }
 
-async fn udp_io_task(
+async fn transport_io_task(
     transport: Arc<dyn Transport>,
     server_addr: std::net::SocketAddr,
     client_id: u32,
     mut tun_rx: mpsc::Receiver<Vec<u8>>,
     tun_tx: mpsc::Sender<Vec<u8>>,
 ) {
-    let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
+    let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
     let mut keepalive_interval = interval(Duration::from_secs(10));
     let mut sequence = 0u32;
-    info!("UDP I/O task started for client {}", client_id);
+    info!("Transport I/O task started for client {}", client_id);
 
     loop {
         tokio::select! {
-            result = transport.recv_from(&mut udp_buf) => {
+            result = transport.recv_from(&mut transport_buf) => {
                 match result {
                     Ok((n, src_addr)) => {
                         if src_addr != server_addr {
-                            info!("UDP: Received packet from unexpected address: {}", src_addr);
+                            info!("Transport: Received packet from unexpected address: {}", src_addr);
                             continue;
                         }
 
                         if n < VpnPacket::HEADER_SIZE {
-                            info!("UDP: Received short packet");
+                            info!("Transport: Received short packet");
                             continue;
                         }
 
-                        match VpnPacket::from_bytes(&udp_buf[..n]) {
+                        match VpnPacket::from_bytes(&transport_buf[..n]) {
                             Ok(header) => {
                                 if header.client_id != client_id {
                                     continue;
@@ -101,9 +101,9 @@ async fn udp_io_task(
                                         let payload_end = payload_start + header.length as usize;
 
                                         if payload_end <= n {
-                                            let payload = udp_buf[payload_start..payload_end].to_vec();
+                                            let payload = transport_buf[payload_start..payload_end].to_vec();
                                             if let Err(e) = tun_tx.send(payload).await {
-                                                error!("UDP: Failed to send to TUN: {}", e);
+                                                error!("Transport: Failed to send to TUN: {}", e);
                                                 break;
                                             }
                                         }
@@ -119,12 +119,12 @@ async fn udp_io_task(
                                 }
                             }
                             Err(e) => {
-                                info!("UDP: Failed to parse packet: {}", e);
+                                info!("Transport: Failed to parse packet: {}", e);
                             }
                         }
                     }
                     Err(e) => {
-                        error!("UDP: Error receiving: {}", e);
+                        error!("Transport: Error receiving: {}", e);
                         break;
                     }
                 }
@@ -141,11 +141,11 @@ async fn udp_io_task(
                         send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
                         if let Err(e) = transport.send_to(&send_buf, server_addr).await {
-                            warn!("UDP: Failed to send to server: {}", e);
+                            warn!("Transport: Failed to send to server: {}", e);
                         }
                     }
                     None => {
-                        error!("UDP: Channel disconnected");
+                        error!("Transport: Channel disconnected");
                         break;
                     }
                 }
@@ -188,23 +188,23 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let client_id = handshake_async(transport.as_ref(), config.server_addr).await?;
     info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);
 
-    let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(4096);
-    let (udp_to_tun_tx, udp_to_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (tun_to_transport_tx, tun_to_transport_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (transport_to_tun_tx, transport_to_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
-            tun_to_udp_tx,
-            udp_to_tun_rx
+            tun_to_transport_tx,
+            transport_to_tun_rx
         )
     );
-    let udp_handle = tokio::spawn(
-        udp_io_task(
+    let transport_handle = tokio::spawn(
+        transport_io_task(
             Arc::clone(&transport),
             config.server_addr,
             client_id,
-            tun_to_udp_rx,
-            udp_to_tun_tx,
+            tun_to_transport_rx,
+            transport_to_tun_tx,
         )
     );
     info!("Client {} is running, press Ctrl+C to stop", client_id);
@@ -213,7 +213,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     info!("Shutting down client {}...", client_id);
 
     tun_handle.abort();
-    udp_handle.abort();
+    transport_handle.abort();
 
     Ok(())
 }

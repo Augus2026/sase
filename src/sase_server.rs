@@ -71,7 +71,7 @@ async fn handle_data(
 
     if payload_end <= data.len() {
         let payload = data[payload_start..payload_end].to_vec();
-        print_packet_info("[udp read]", &payload);
+        print_packet_info("[transport read]", &payload);
         if let Err(e) = tun_tx.send(payload).await {
             error!("Failed to send to TUN writer: {}", e);
             true
@@ -143,7 +143,7 @@ async fn send_to_client(
     send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
     send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
-    print_packet_info("[udp write]", &send_buf);
+    print_packet_info("[transport write]", &send_buf);
     if let Err(e) = transport.send_to(&send_buf, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
     }
@@ -174,31 +174,31 @@ async fn handle_message(
     }
 }
 
-async fn udp_io_task(
+async fn transport_io_task(
     transport: Arc<dyn Transport>,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
     mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    let mut udp_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
+    let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
     let mut next_client_id = 2u32;
-    info!("UDP I/O task started");
+    info!("Transport I/O task started");
 
     loop {
         tokio::select! {
-            result = transport.recv_from(&mut udp_buf) => {
+            result = transport.recv_from(&mut transport_buf) => {
                 match result {
                     Ok((n, src_addr)) => {
                         if n < VpnPacket::HEADER_SIZE {
-                            info!("UDP: Received short packet from {}", src_addr);
+                            info!("Transport: Received short packet from {}", src_addr);
                             continue;
                         }
 
-                        match VpnPacket::from_bytes(&udp_buf[..n]) {
+                        match VpnPacket::from_bytes(&transport_buf[..n]) {
                             Ok(header) => {
                                 handle_message(
                                     header,
-                                    &udp_buf[..n],
+                                    &transport_buf[..n],
                                     src_addr,
                                     transport.as_ref(),
                                     &clients,
@@ -212,7 +212,7 @@ async fn udp_io_task(
                         }
                     }
                     Err(e) => {
-                        error!("UDP: Error receiving: {}", e);
+                        error!("Transport: Error receiving: {}", e);
                         break;
                     }
                 }
@@ -230,7 +230,7 @@ async fn udp_io_task(
                         }
                     }
                     None => {
-                        error!("UDP: Channel disconnected");
+                        error!("Transport: Channel disconnected");
                         break;
                     }
                 }
@@ -254,22 +254,22 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     std_socket.set_nonblocking(true)?;
     let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
     let transport: Arc<dyn Transport> = Arc::new(udp_transport);
-    let (tun_to_udp_tx, tun_to_udp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let (udp_to_tun_tx, udp_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
-            tun_to_udp_tx,
-            udp_to_tun_rx
+            tun_to_transport_tx,
+            transport_to_tun_rx
         )
     );
-    let udp_handle = tokio::spawn(
-        udp_io_task(
+    let transport_handle = tokio::spawn(
+        transport_io_task(
             Arc::clone(&transport),
             Arc::clone(&clients),
-            tun_to_udp_rx,
-            udp_to_tun_tx
+            tun_to_transport_rx,
+            transport_to_tun_tx
         )
     );
 
@@ -280,7 +280,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     info!("Shutting down server...");
 
     tun_handle.abort();
-    udp_handle.abort();
+    transport_handle.abort();
 
     Ok(())
 }
