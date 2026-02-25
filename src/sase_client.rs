@@ -1,4 +1,4 @@
-use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, Transport, UdpTransport};
+use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, Transport, UdpTransport, TcpTransport};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -164,7 +164,7 @@ async fn transport_io_task(
     }
 }
 
-pub async fn run_client(config: ClientConfig) -> Result<()> {
+pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<()> {
     info!("Creating TUN device: {}", config.tun_name);
 
     let mut tun_config = Configuration::default();
@@ -179,11 +179,20 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let tun = create_as_async(&tun_config)?;
     info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
 
-    let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
-    std_socket.set_nonblocking(true)?;
-
-    let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
-    let transport: Arc<dyn Transport> = Arc::new(udp_transport);
+    let transport: Arc<dyn Transport> = match transport_type.to_lowercase().as_str() {
+        "tcp" => {
+            info!("Using TCP transport");
+            let tcp_transport = TcpTransport::connect(config.server_addr).await?;
+            Arc::new(tcp_transport)
+        }
+        "udp" | _ => {
+            info!("Using UDP transport");
+            let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
+            std_socket.set_nonblocking(true)?;
+            let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+            Arc::new(udp_transport)
+        }
+    };
 
     let client_id = handshake_async(transport.as_ref(), config.server_addr).await?;
     info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);
@@ -226,8 +235,10 @@ pub async fn run_client_with_args(
     mtu: Option<usize>,
     recv_buffer: Option<usize>,
     send_buffer: Option<usize>,
+    transport: Option<String>,
 ) -> Result<()> {
     let mut config = ClientConfig::default();
+    let transport_type = transport.unwrap_or_else(|| "udp".to_string());
 
     if let Some(server) = server {
         config.server_addr = server.parse()?;
@@ -258,6 +269,7 @@ pub async fn run_client_with_args(
     }
 
     info!("Client configuration: {:?}", config);
+    info!("Transport protocol: {}", transport_type);
 
-    run_client(config).await
+    run_client(config, transport_type).await
 }

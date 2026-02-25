@@ -1,4 +1,4 @@
-cargo run --release -- server --bind 0.0.0.0:12345 --tun tun1 --address 10.0.0.1 --recv-buffer 8 --send-buffer 8 --transparent-proxy
-cargo run --release -- client --server 192.168.6.111:12345 --tun tun2 --address 10.0.0.2 --recv-buffer 8 --send-buffer 8 
+cargo run --release -- server --transport tcp --bind 0.0.0.0:12345 --tun tun1 --address 10.0.0.1
+cargo run --release -- client --transport tcp --server 192.168.6.111:12345 --tun tun2 --address 10.0.0.2
 
 route add 110.242.74.102 mask 255.255.255.255 10.0.0.1

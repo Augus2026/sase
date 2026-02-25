@@ -1,4 +1,4 @@
-use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, Transport, UdpTransport};
+use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, Transport, UdpTransport, TcpTransport};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -239,7 +239,7 @@ async fn transport_io_task(
     }
 }
 
-pub async fn run_server(config: ServerConfig) -> Result<()> {
+pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<()> {
     let mut tun_config = Configuration::default();
     tun_config
         .tun_name(&config.tun_name)
@@ -250,10 +250,22 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         .up();
     let tun = create_as_async(&tun_config)?;
 
-    let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
-    std_socket.set_nonblocking(true)?;
-    let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
-    let transport: Arc<dyn Transport> = Arc::new(udp_transport);
+    let transport: Arc<dyn Transport> = match transport_type.to_lowercase().as_str() {
+        "tcp" => {
+            info!("Using TCP transport");
+            let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+            info!("TCP server listening on {}", config.bind_addr);
+            Arc::new(TcpTransport::new(listener))
+        }
+        "udp" | _ => {
+            info!("Using UDP transport");
+            let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
+            std_socket.set_nonblocking(true)?;
+            let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+            Arc::new(udp_transport)
+        }
+    };
+
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
@@ -293,8 +305,10 @@ pub async fn run_server_with_args(
     mtu: Option<usize>,
     recv_buffer: Option<usize>,
     send_buffer: Option<usize>,
+    transport: Option<String>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
+    let transport_type = transport.unwrap_or_else(|| "udp".to_string());
 
     if let Some(bind) = bind {
         config.bind_addr = bind.parse()?;
@@ -325,6 +339,7 @@ pub async fn run_server_with_args(
     }
 
     info!("Server configuration: {:?}", config);
+    info!("Transport protocol: {}", transport_type);
 
-    run_server(config).await
+    run_server(config, transport_type).await
 }
