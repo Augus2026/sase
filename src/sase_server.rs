@@ -250,13 +250,23 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
         .up();
     let tun = create_as_async(&tun_config)?;
 
-    // For TCP, we need to handle connections differently
-    if transport_type.to_lowercase().as_str() == "tcp" {
-        info!("Using TCP transport");
-        return run_tcp_server(config, tun).await;
+    match transport_type.to_lowercase().as_str() {
+        "tcp" => {
+            info!("Using TCP transport");
+            run_tcp_server(config, tun).await
+        }
+        "udp" => {
+            info!("Using UDP transport");
+            run_udp_server(config, tun).await
+        }
+        _ => {
+            error!("Unknown transport type: {}", transport_type);
+            Err(anyhow::anyhow!("Unknown transport type: {}", transport_type))
+        }
     }
+}
 
-    // UDP server (original logic)
+async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
     std_socket.set_nonblocking(true)?;
     let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
@@ -281,9 +291,6 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
         )
     );
 
-    info!("Server ready, waiting for client connections...");
-    info!("For transparent proxy, run: sudo ./proxy_nat.sh");
-
     tokio::signal::ctrl_c().await?;
     info!("Shutting down server...");
 
@@ -293,8 +300,6 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
     Ok(())
 }
 
-/// TCP-specific server implementation
-/// TCP requires accepting connections before handling data
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     info!("TCP server listening on {}", config.bind_addr);
@@ -311,8 +316,6 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    info!("Server ready, waiting for TCP client connections...");
-
     // Accept first TCP connection
     let (stream, addr) = listener.accept().await?;
     info!("TCP connection accepted from {}", addr);
@@ -328,8 +331,6 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
             transport_to_tun_tx
         )
     );
-
-    info!("For transparent proxy, run: sudo ./proxy_nat.sh");
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down server...");
