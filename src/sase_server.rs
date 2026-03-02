@@ -6,13 +6,9 @@ use crate::common::{
     print_packet_info,
     tun_io_task
 };
-use crate::transport::{
-    Transport,
-    UdpTransport,
-    TcpTransport,
-    DEFAULT_RECV_BUFFER_SIZE,
-    DEFAULT_SEND_BUFFER_SIZE
-};
+use crate::transport::Transport;
+use crate::tcp_transport::TcpTransport;
+use crate::udp_transport::UdpTransport;
 use anyhow::Result;
 use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -283,7 +279,7 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
     std_socket.set_nonblocking(true)?;
-    let udp_transport = UdpTransport::from_std(std_socket, DEFAULT_RECV_BUFFER_SIZE, DEFAULT_SEND_BUFFER_SIZE)?;
+    let udp_transport = UdpTransport::from_std(std_socket)?;
     let transport: Arc<dyn Transport> = Arc::new(udp_transport);
 
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);

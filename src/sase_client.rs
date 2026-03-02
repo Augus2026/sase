@@ -5,13 +5,9 @@ use crate::common::{
     TUN_MTU,
     tun_io_task
 };
-use crate::transport::{
-    Transport,
-    UdpTransport,
-    TcpTransport,
-    DEFAULT_RECV_BUFFER_SIZE,
-    DEFAULT_SEND_BUFFER_SIZE
-};
+use crate::transport::Transport;
+use crate::tcp_transport::TcpTransport;
+use crate::udp_transport::UdpTransport;
 use anyhow::Result;
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -202,7 +198,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             info!("Using UDP transport");
             let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
             std_socket.set_nonblocking(true)?;
-            let udp_transport = UdpTransport::from_std(std_socket, DEFAULT_RECV_BUFFER_SIZE, DEFAULT_SEND_BUFFER_SIZE)?;
+            let udp_transport = UdpTransport::from_std(std_socket)?;
             Arc::new(udp_transport)
         }
     };
