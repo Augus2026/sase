@@ -45,14 +45,16 @@ pub struct UdpTransport {
 }
 
 impl UdpTransport {
-    pub fn new(socket: Arc<UdpSocket>) -> Self {
-        Self { socket }
-    }
+    pub fn new(bind_addr: SocketAddr) -> Result<Self> {
+        info!("Binding UDP socket to {}", bind_addr);
 
-    pub fn from_std(std_socket: StdUdpSocket) -> Result<Self> {
+        let std_socket = StdUdpSocket::bind(bind_addr)?;
+        std_socket.set_nonblocking(true)?;
+
         let recv_buffer_size = DEFAULT_RECV_BUFFER_SIZE;
         let send_buffer_size = DEFAULT_SEND_BUFFER_SIZE;
         let socket = configure_udp_socket(std_socket, recv_buffer_size, send_buffer_size)?;
+
         Ok(Self { socket })
     }
 }

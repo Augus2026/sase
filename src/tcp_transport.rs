@@ -14,50 +14,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, TcpListener, TcpStream};
 
 pub struct TcpTransport {
-    listener: Option<Arc<TcpListener>>,
     stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
     remote_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
     read_buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
 }
 
 impl TcpTransport {
-    pub fn new(listener: TcpListener) -> Self {
-        Self {
-            listener: Some(Arc::new(listener)),
-            stream: Arc::new(tokio::sync::Mutex::new(None)),
-            remote_addr: Arc::new(tokio::sync::Mutex::new(None)),
-            read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        }
-    }
-
-    pub async fn accept(&self) -> Result<TcpStream> {
-        let listener = self.listener.as_ref().ok_or_else(|| anyhow::anyhow!("No listener available"))?;
-        let (stream, addr) = listener.accept().await?;
-        info!("TCP connection accepted from {}", addr);
-
-        {
-            let mut remote_addr = self.remote_addr.lock().await;
-            *remote_addr = Some(addr);
-        }
-
-        {
-            let mut stored_stream = self.stream.lock().await;
-            *stored_stream = Some(stream);
-        }
-
-        {
-            let mut buffer = self.read_buffer.lock().await;
-            buffer.clear();
-        }
-
-        anyhow::bail!("TCP stream cannot be cloned, use the stored stream")
-    }
-
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        info!("TCP connection established to {}", addr);
 
         let transport = Self {
-            listener: None,
             stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
             remote_addr: Arc::new(tokio::sync::Mutex::new(Some(addr))),
             read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -66,26 +33,17 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    pub fn from_accepted_stream(stream: TcpStream, addr: SocketAddr) -> Self {
-        info!("Creating TcpTransport from accepted stream, remote addr: {}", addr);
-        Self {
-            listener: None,
+    pub async fn accept(listener: &TcpListener) -> Result<Self> {
+        let (stream, addr) = listener.accept().await?;
+        info!("TCP connection accepted from {}", addr);
+
+        let transport = Self {
             stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
             remote_addr: Arc::new(tokio::sync::Mutex::new(Some(addr))),
             read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        }
-    }
+        };
 
-    async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
-        let mut pos = 0;
-        while pos < buf.len() {
-            let n = stream.read(&mut buf[pos..]).await?;
-            if n == 0 {
-                anyhow::bail!("Connection closed unexpectedly");
-            }
-            pos += n;
-        }
-        Ok(())
+        Ok(transport)
     }
 }
 

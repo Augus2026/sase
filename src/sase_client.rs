@@ -196,9 +196,8 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
         }
         "udp" | _ => {
             info!("Using UDP transport");
-            let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
-            std_socket.set_nonblocking(true)?;
-            let udp_transport = UdpTransport::from_std(std_socket)?;
+            let bind_addr = "0.0.0.0:0".parse()?;
+            let udp_transport = UdpTransport::new(bind_addr)?;
             Arc::new(udp_transport)
         }
     };

@@ -277,9 +277,7 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
 }
 
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
-    std_socket.set_nonblocking(true)?;
-    let udp_transport = UdpTransport::from_std(std_socket)?;
+    let udp_transport = UdpTransport::new(config.bind_addr)?;
     let transport: Arc<dyn Transport> = Arc::new(udp_transport);
 
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -311,9 +309,6 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 }
 
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    info!("TCP server listening on {}", config.bind_addr);
-
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
@@ -326,13 +321,11 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    // Accept first TCP connection
-    let (stream, addr) = listener.accept().await?;
-    info!("TCP connection accepted from {}", addr);
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    info!("TCP server listening on {}", config.bind_addr);
 
-    let tcp_transport = TcpTransport::from_accepted_stream(stream, addr);
+    let tcp_transport = TcpTransport::accept(&listener).await?;
     let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
-
     let transport_handle = tokio::spawn(
         transport_io_task(
             Arc::clone(&transport),
