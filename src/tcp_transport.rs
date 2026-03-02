@@ -33,7 +33,10 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    pub async fn accept(listener: &TcpListener) -> Result<Self> {
+    pub async fn accept(bind_addr: &SocketAddr) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        info!("TCP server listening on {}", bind_addr);
+
         let (stream, addr) = listener.accept().await?;
         info!("TCP connection accepted from {}", addr);
 

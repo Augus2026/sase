@@ -321,10 +321,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    info!("TCP server listening on {}", config.bind_addr);
-
-    let tcp_transport = TcpTransport::accept(&listener).await?;
+    let tcp_transport = TcpTransport::accept(&config.bind_addr).await?;
     let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
     let transport_handle = tokio::spawn(
         transport_io_task(
