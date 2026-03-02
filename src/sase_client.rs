@@ -1,4 +1,17 @@
-use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, Transport, UdpTransport, TcpTransport};
+use crate::common::{
+    ClientConfig,
+    PacketType,
+    VpnPacket,
+    TUN_MTU,
+    tun_io_task
+};
+use crate::transport::{
+    Transport,
+    UdpTransport,
+    TcpTransport,
+    DEFAULT_RECV_BUFFER_SIZE,
+    DEFAULT_SEND_BUFFER_SIZE
+};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -189,7 +202,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             info!("Using UDP transport");
             let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
             std_socket.set_nonblocking(true)?;
-            let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+            let udp_transport = UdpTransport::from_std(std_socket, DEFAULT_RECV_BUFFER_SIZE, DEFAULT_SEND_BUFFER_SIZE)?;
             Arc::new(udp_transport)
         }
     };
@@ -233,8 +246,6 @@ pub async fn run_client_with_args(
     address: Option<String>,
     netmask: Option<String>,
     mtu: Option<usize>,
-    recv_buffer: Option<usize>,
-    send_buffer: Option<usize>,
     transport: Option<String>,
 ) -> Result<()> {
     let mut config = ClientConfig::default();
@@ -258,14 +269,6 @@ pub async fn run_client_with_args(
 
     if let Some(mtu) = mtu {
         config.mtu = mtu;
-    }
-
-    if let Some(recv_buffer_mb) = recv_buffer {
-        config.socket_recv_buffer_size = recv_buffer_mb * 1024 * 1024;
-    }
-
-    if let Some(send_buffer_mb) = send_buffer {
-        config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
     }
 
     info!("Client configuration: {:?}", config);

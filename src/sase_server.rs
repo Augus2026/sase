@@ -1,4 +1,18 @@
-use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task, Transport, UdpTransport, TcpTransport};
+use crate::common::{
+    PacketType,
+    ServerConfig,
+    VpnPacket,
+    TUN_MTU,
+    print_packet_info,
+    tun_io_task
+};
+use crate::transport::{
+    Transport,
+    UdpTransport,
+    TcpTransport,
+    DEFAULT_RECV_BUFFER_SIZE,
+    DEFAULT_SEND_BUFFER_SIZE
+};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -269,7 +283,7 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let std_socket = StdUdpSocket::bind(&config.bind_addr)?;
     std_socket.set_nonblocking(true)?;
-    let udp_transport = UdpTransport::from_std(std_socket, config.socket_recv_buffer_size, config.socket_send_buffer_size)?;
+    let udp_transport = UdpTransport::from_std(std_socket, DEFAULT_RECV_BUFFER_SIZE, DEFAULT_SEND_BUFFER_SIZE)?;
     let transport: Arc<dyn Transport> = Arc::new(udp_transport);
 
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -347,8 +361,6 @@ pub async fn run_server_with_args(
     address: Option<String>,
     netmask: Option<String>,
     mtu: Option<usize>,
-    recv_buffer: Option<usize>,
-    send_buffer: Option<usize>,
     transport: Option<String>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
@@ -372,14 +384,6 @@ pub async fn run_server_with_args(
 
     if let Some(mtu) = mtu {
         config.mtu = mtu;
-    }
-
-    if let Some(recv_buffer_mb) = recv_buffer {
-        config.socket_recv_buffer_size = recv_buffer_mb * 1024 * 1024;
-    }
-
-    if let Some(send_buffer_mb) = send_buffer {
-        config.socket_send_buffer_size = send_buffer_mb * 1024 * 1024;
     }
 
     info!("Server configuration: {:?}", config);

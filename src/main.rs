@@ -1,5 +1,6 @@
 mod sase_client;
 mod sase_server;
+mod transport;
 mod common;
 
 use anyhow::Result;
@@ -39,21 +40,9 @@ enum Commands {
         #[arg(short = 'm', long)]
         mtu: Option<usize>,
 
-        /// Socket receive buffer size in MB (default: 2)
-        #[arg(long)]
-        recv_buffer: Option<usize>,
-
-        /// Socket send buffer size in MB (default: 2)
-        #[arg(long)]
-        send_buffer: Option<usize>,
-
         /// Transport protocol: tcp or udp (default: udp)
         #[arg(short, long)]
         transport: Option<String>,
-
-        /// Verbose logging
-        #[arg(short, long)]
-        verbose: bool,
     },
     /// Start the VPN client
     Client {
@@ -77,21 +66,9 @@ enum Commands {
         #[arg(short = 'm', long)]
         mtu: Option<usize>,
 
-        /// Socket receive buffer size in MB (default: 2)
-        #[arg(long)]
-        recv_buffer: Option<usize>,
-
-        /// Socket send buffer size in MB (default: 2)
-        #[arg(long)]
-        send_buffer: Option<usize>,
-
         /// Transport protocol: tcp or udp (default: udp)
         #[arg(short, long)]
         transport: Option<String>,
-
-        /// Verbose logging
-        #[arg(short, long)]
-        verbose: bool,
     },
 }
 
@@ -106,18 +83,15 @@ async fn main() -> Result<()> {
             address,
             netmask,
             mtu,
-            recv_buffer,
-            send_buffer,
             transport,
-            verbose,
         } => {
             env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or(if verbose { "debug" } else { "info" }),
+                env_logger::Env::default().default_filter_or("debug"),
             )
             .init();
 
             info!("Starting SASE VPN Server");
-            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, recv_buffer, send_buffer, transport).await
+            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, transport).await
         }
         Commands::Client {
             server,
@@ -125,18 +99,15 @@ async fn main() -> Result<()> {
             address,
             netmask,
             mtu,
-            recv_buffer,
-            send_buffer,
             transport,
-            verbose,
         } => {
             env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or(if verbose { "debug" } else { "info" }),
+                env_logger::Env::default().default_filter_or("debug"),
             )
             .init();
 
             info!("Starting SASE VPN Client");
-            sase_client::run_client_with_args(server, tun, address, netmask, mtu, recv_buffer, send_buffer, transport).await
+            sase_client::run_client_with_args(server, tun, address, netmask, mtu, transport).await
         }
     }
 }
