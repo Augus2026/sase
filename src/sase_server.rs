@@ -393,15 +393,40 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     let clients_clone = Arc::clone(&clients);
     let tun_tx_clone = transport_to_tun_tx.clone();
     let accept_task = tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&config.bind_addr).await {
+            Ok(l) => {
+                info!("TCP server listening on {}", config.bind_addr);
+                l
+            }
+            Err(e) => {
+                error!("Failed to bind TCP listener: {}", e);
+                return;
+            }
+        };
+
         loop {
-            match TcpTransport::accept(&config.bind_addr).await {
-                Ok(tcp_transport) => {
-                    let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
-                    let clients = Arc::clone(&clients_clone);
-                    let tun_tx = tun_tx_clone.clone();
-                    tokio::spawn(async move {
-                        tcp_recv_io_task(transport, clients, tun_tx).await;
-                    });
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    // Disable Nagle's algorithm to reduce latency for small packets
+                    if let Err(e) = stream.set_nodelay(true) {
+                        error!("Failed to set TCP_NODELAY: {}", e);
+                        continue;
+                    }
+                    info!("TCP connection accepted from {}", addr);
+
+                    match TcpTransport::from_stream(stream, addr) {
+                        Ok(tcp_transport) => {
+                            let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
+                            let clients = Arc::clone(&clients_clone);
+                            let tun_tx = tun_tx_clone.clone();
+                            tokio::spawn(async move {
+                                tcp_recv_io_task(transport, clients, tun_tx).await;
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to create TCP transport: {}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Failed to accept TCP connection: {}", e);

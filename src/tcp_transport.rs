@@ -32,20 +32,10 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    pub async fn accept(bind_addr: &SocketAddr) -> Result<Self> {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        info!("TCP server listening on {}", bind_addr);
-
-        let (stream, addr) = listener.accept().await?;
-
-        // Disable Nagle's algorithm to reduce latency for small packets
-        stream.set_nodelay(true)?;
-
-        info!("TCP connection accepted from {}", addr);
-
+    pub fn from_stream(stream: TcpStream, remote_addr: SocketAddr) -> Result<Self> {
         let transport = Self {
             stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
-            cached_remote_addr: addr,
+            cached_remote_addr: remote_addr,
             read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(8192))),
         };
 
