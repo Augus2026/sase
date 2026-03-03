@@ -136,6 +136,8 @@ async fn send_to_client(
     transport: &dyn Transport,
     client: &Client,
 ) {
+    print_packet_info("[transport write]", &data);
+
     let packet = VpnPacket::new(
         PacketType::Data,
         client.client_id,
@@ -147,7 +149,6 @@ async fn send_to_client(
     send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
     send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
-    print_packet_info("[transport write]", &send_buf);
     if let Err(e) = transport.send_to(&send_buf, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
     }
