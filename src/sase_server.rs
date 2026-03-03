@@ -304,33 +304,30 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
 async fn tcp_send_io_task(
     clients: Arc<Mutex<HashMap<u32, Client>>>,
-    mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>
+    mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     loop {
-        tokio::select! {
-            result = tun_rx.recv() => {
-                match result {
-                    Some(data) => {
-                        let clients_map = clients.lock().await;
-                        if let Some(dest_ip) = get_destination_ip(&data) {
-                            let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
-                            if let Some(client) = target_client {
-                                let transport = client.transport.clone();
-                                send_to_client(&data, transport.as_ref(), client).await;
-                            }
-                        }
-                    }
-                    None => {
-                        error!("Transport: Channel disconnected");
-                        break;
+        match tun_rx.recv().await {
+            Some(data) => {
+                let clients_map = clients.lock().await;
+                if let Some(dest_ip) = get_destination_ip(&data) {
+                    let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+                    if let Some(client) = target_client {
+                        let transport = client.transport.clone();
+                        send_to_client(&data, transport.as_ref(), client).await;
                     }
                 }
+            }
+            None => {
+                error!("Transport: Channel disconnected");
+                break;
             }
         }
     }
 }
 
-async fn tcp_recv_io_task(transport: Arc<dyn Transport>,
+async fn tcp_recv_io_task(
+    transport: Arc<dyn Transport>,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
@@ -339,37 +336,34 @@ async fn tcp_recv_io_task(transport: Arc<dyn Transport>,
     info!("Transport I/O task started");
 
     loop {
-        tokio::select! {
-            result = transport.recv_from(&mut transport_buf) => {
-                match result {
-                    Ok((n, src_addr)) => {
-                        if n < VpnPacket::HEADER_SIZE {
-                            info!("Transport: Received short packet from {}", src_addr);
-                            continue;
-                        }
+        match transport.recv_from(&mut transport_buf).await {
+            Ok((n, src_addr)) => {
+                if n < VpnPacket::HEADER_SIZE {
+                    info!("Transport: Received short packet from {}", src_addr);
+                    continue;
+                }
 
-                        match VpnPacket::from_bytes(&transport_buf[..n]) {
-                            Ok(header) => {
-                                handle_message(
-                                    header,
-                                    &transport_buf[..n],
-                                    src_addr,
-                                    Arc::clone(&transport),
-                                    &clients,
-                                    &mut next_client_id,
-                                    &tun_tx,
-                                ).await;
-                            }
-                            Err(e) => {
-                                info!("Failed to parse packet from {}: {}", src_addr, e);
-                            }
-                        }
+                match VpnPacket::from_bytes(&transport_buf[..n]) {
+                    Ok(header) => {
+                        handle_message(
+                            header,
+                            &transport_buf[..n],
+                            src_addr,
+                            Arc::clone(&transport),
+                            &clients,
+                            &mut next_client_id,
+                            &tun_tx,
+                        )
+                        .await;
                     }
                     Err(e) => {
-                        error!("Transport: Error receiving: {}", e);
-                        break;
+                        info!("Failed to parse packet from {}: {}", src_addr, e);
                     }
                 }
+            }
+            Err(e) => {
+                error!("Transport: Error receiving: {}", e);
+                break;
             }
         }
     }
