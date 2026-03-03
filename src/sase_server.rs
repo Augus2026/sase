@@ -1,11 +1,4 @@
-use crate::common::{
-    PacketType,
-    ServerConfig,
-    VpnPacket,
-    TUN_MTU,
-    print_packet_info,
-    tun_io_task
-};
+use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task};
 use crate::transport::Transport;
 use crate::tcp_transport::TcpTransport;
 use crate::udp_transport::UdpTransport;
@@ -16,7 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
-use std::net::UdpSocket as StdUdpSocket;
 
 #[derive(Clone)]
 struct Client {
@@ -24,11 +16,12 @@ struct Client {
     client_id: u32,
     sequence: u32,
     virtual_ip: Ipv4Addr,
+    transport: Arc<dyn Transport>,
 }
 
 async fn handle_handshake(
     src_addr: SocketAddr,
-    transport: &dyn Transport,
+    transport: Arc<dyn Transport>,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     next_client_id: &mut u32,
 ) {
@@ -45,6 +38,7 @@ async fn handle_handshake(
             client_id: *next_client_id,
             sequence: 0,
             virtual_ip,
+            transport: Arc::clone(&transport),
         };
 
         {
@@ -163,20 +157,20 @@ async fn handle_message(
     header: VpnPacket,
     data: &[u8],
     src_addr: SocketAddr,
-    transport: &dyn Transport,
+    transport: Arc<dyn Transport>,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     next_client_id: &mut u32,
     tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     match header.packet_type {
         PacketType::Handshake => {
-            handle_handshake(src_addr, transport, clients, next_client_id).await;
+            handle_handshake(src_addr, Arc::clone(&transport), clients, next_client_id).await;
         }
         PacketType::Data => {
             handle_data(&header, data, tun_tx).await;
         }
         PacketType::KeepAlive => {
-            handle_keepalive(&header, src_addr, transport).await;
+            handle_keepalive(&header, src_addr, transport.as_ref()).await;
         }
         PacketType::Disconnect => {
             handle_disconnect(&header, clients).await;
@@ -210,7 +204,7 @@ async fn transport_io_task(
                                     header,
                                     &transport_buf[..n],
                                     src_addr,
-                                    transport.as_ref(),
+                                    Arc::clone(&transport),
                                     &clients,
                                     &mut next_client_id,
                                     &tun_tx,
@@ -308,6 +302,79 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     Ok(())
 }
 
+async fn tcp_send_io_task(
+    clients: Arc<Mutex<HashMap<u32, Client>>>,
+    mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>
+) {
+    loop {
+        tokio::select! {
+            result = tun_rx.recv() => {
+                match result {
+                    Some(data) => {
+                        let clients_map = clients.lock().await;
+                        if let Some(dest_ip) = get_destination_ip(&data) {
+                            let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+                            if let Some(client) = target_client {
+                                let transport = client.transport.clone();
+                                send_to_client(&data, transport.as_ref(), client).await;
+                            }
+                        }
+                    }
+                    None => {
+                        error!("Transport: Channel disconnected");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn tcp_recv_io_task(transport: Arc<dyn Transport>,
+    clients: Arc<Mutex<HashMap<u32, Client>>>,
+    tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
+    let mut next_client_id = 2u32;
+    info!("Transport I/O task started");
+
+    loop {
+        tokio::select! {
+            result = transport.recv_from(&mut transport_buf) => {
+                match result {
+                    Ok((n, src_addr)) => {
+                        if n < VpnPacket::HEADER_SIZE {
+                            info!("Transport: Received short packet from {}", src_addr);
+                            continue;
+                        }
+
+                        match VpnPacket::from_bytes(&transport_buf[..n]) {
+                            Ok(header) => {
+                                handle_message(
+                                    header,
+                                    &transport_buf[..n],
+                                    src_addr,
+                                    Arc::clone(&transport),
+                                    &clients,
+                                    &mut next_client_id,
+                                    &tun_tx,
+                                ).await;
+                            }
+                            Err(e) => {
+                                info!("Failed to parse packet from {}: {}", src_addr, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Transport: Error receiving: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -321,22 +388,40 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    let tcp_transport = TcpTransport::accept(&config.bind_addr).await?;
-    let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
-    let transport_handle = tokio::spawn(
-        transport_io_task(
-            Arc::clone(&transport),
+    let tcp_send_handle = tokio::spawn(
+        tcp_send_io_task(
             Arc::clone(&clients),
-            tun_to_transport_rx,
-            transport_to_tun_tx
+            tun_to_transport_rx
         )
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down server...");
-
-    tun_handle.abort();
-    transport_handle.abort();
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(e) = result {
+                error!("Failed to wait for Ctrl+C: {}", e);
+            }
+            info!("Shutting down server...");
+            tun_handle.abort();
+            tcp_send_handle.abort();
+        }
+        result = TcpTransport::accept(&config.bind_addr) => {
+            match result {
+                Ok(tcp_transport) => {
+                    let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
+                    let _transport_handle = tokio::spawn(
+                        tcp_recv_io_task(
+                            Arc::clone(&transport),
+                            Arc::clone(&clients),
+                            transport_to_tun_tx.clone()
+                        )
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to accept TCP connection: {}", e);
+                }
+            }
+        }
+    }
 
     Ok(())
 }

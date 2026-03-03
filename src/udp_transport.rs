@@ -1,17 +1,9 @@
-use crate::common::{
-    VpnPacket,
-    TUN_MTU
-};
-use crate::transport::{
-    Transport
-};
+use crate::transport::Transport;
 use anyhow::Result;
-use log::{debug, info, warn, error};
-use std::net::{Ipv4Addr, SocketAddr};
+use log::info;
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
-use std::net::UdpSocket as StdUdpSocket;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UdpSocket, TcpListener, TcpStream};
+use tokio::net::UdpSocket;
 
 pub const DEFAULT_RECV_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_SEND_BUFFER_SIZE: usize = 4 * 1024 * 1024;

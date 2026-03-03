@@ -1,10 +1,4 @@
-use crate::common::{
-    ClientConfig,
-    PacketType,
-    VpnPacket,
-    TUN_MTU,
-    tun_io_task
-};
+use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task};
 use crate::transport::Transport;
 use crate::tcp_transport::TcpTransport;
 use crate::udp_transport::UdpTransport;
@@ -15,7 +9,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tun2::{create_as_async, Configuration};
-use std::net::UdpSocket as StdUdpSocket;
 
 async fn handshake_async(transport: &dyn Transport, server_addr: std::net::SocketAddr) -> Result<u32> {
     info!("Connecting to server at {}", server_addr);

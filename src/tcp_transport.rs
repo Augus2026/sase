@@ -1,17 +1,11 @@
-use crate::common::{
-    VpnPacket,
-    TUN_MTU
-};
-use crate::transport::{
-    Transport
-};
+use crate::common::{TUN_MTU, VpnPacket};
+use crate::transport::Transport;
 use anyhow::Result;
-use log::{debug, info, warn, error};
-use std::net::{Ipv4Addr, SocketAddr};
+use log::{debug, info, error};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::net::UdpSocket as StdUdpSocket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UdpSocket, TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 pub struct TcpTransport {
     stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
