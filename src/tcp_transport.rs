@@ -1,7 +1,7 @@
 use crate::common::{TUN_MTU, VpnPacket};
 use crate::transport::Transport;
 use anyhow::Result;
-use log::{debug, info, error};
+use log::{info, trace};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,7 +9,8 @@ use tokio::net::TcpStream;
 
 pub struct TcpTransport {
     stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
-    remote_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    // Cache remote address to avoid frequent locking
+    cached_remote_addr: SocketAddr,
     read_buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
 }
 
@@ -24,8 +25,8 @@ impl TcpTransport {
 
         let transport = Self {
             stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
-            remote_addr: Arc::new(tokio::sync::Mutex::new(Some(addr))),
-            read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            cached_remote_addr: addr,
+            read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(8192))),
         };
 
         Ok(transport)
@@ -44,11 +45,82 @@ impl TcpTransport {
 
         let transport = Self {
             stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
-            remote_addr: Arc::new(tokio::sync::Mutex::new(Some(addr))),
-            read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            cached_remote_addr: addr,
+            read_buffer: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(8192))),
         };
 
         Ok(transport)
+    }
+
+    // Helper: Try to read a complete frame from buffer without holding stream lock
+    fn try_read_from_buffer(&self, buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+        if buffer.len() < 4 {
+            return Ok(None);
+        }
+
+        let msg_len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+
+        // Check if message length is reasonable
+        if msg_len > TUN_MTU + VpnPacket::HEADER_SIZE {
+            anyhow::bail!("Message too large: {}", msg_len);
+        }
+
+        // Check if we have the complete message
+        if buffer.len() < 4 + msg_len {
+            return Ok(None);
+        }
+
+        // Extract the message (without length prefix)
+        let message = buffer[4..4 + msg_len].to_vec();
+
+        // Remove the consumed data from buffer
+        buffer.drain(0..4 + msg_len);
+
+        Ok(Some(message))
+    }
+
+    // Helper: Copy message to output buffer
+    fn copy_to_buffer(&self, message: &[u8], buf: &mut [u8]) -> usize {
+        let len = std::cmp::min(message.len(), buf.len());
+        if len > 0 {
+            buf[..len].copy_from_slice(&message[..len]);
+        }
+        len
+    }
+
+    // Helper: Read data from stream into buffer
+    async fn read_stream_data(&self, buffer: &mut Vec<u8>) -> Result<()> {
+        let mut stream_guard = self.stream.lock().await;
+        let stream = stream_guard.as_mut().ok_or_else(|| anyhow::anyhow!("No active TCP connection"))?;
+
+        // Pre-allocate space to minimize reallocations
+        if buffer.capacity() < buffer.len() + 4096 {
+            buffer.reserve(4096);
+        }
+
+        let mut temp_buf = [0u8; 4096];
+
+        // Read data with timeout to prevent indefinite blocking
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream.read(&mut temp_buf)
+        ).await {
+            Ok(Ok(n)) => {
+                if n == 0 {
+                    anyhow::bail!("Connection closed");
+                }
+                buffer.extend_from_slice(&temp_buf[..n]);
+                trace!("Read {} bytes from stream, buffer size: {}", n, buffer.len());
+            }
+            Ok(Err(e)) => {
+                anyhow::bail!("Stream read error: {}", e);
+            }
+            Err(_) => {
+                anyhow::bail!("Stream read timeout");
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -60,77 +132,55 @@ impl Transport for TcpTransport {
 
         // Add frame: [length (4 bytes, big-endian)] + [data]
         let length = buf.len() as u32;
-        let mut frame = Vec::with_capacity(4 + buf.len());
-        frame.extend_from_slice(&length.to_be_bytes());
-        frame.extend_from_slice(buf);
+        let length_bytes = length.to_be_bytes();
 
-        stream.write_all(&frame).await?;
+        // Write length prefix first
+        stream.write_all(&length_bytes).await?;
+
+        // Then write the data directly without extra allocation
+        if !buf.is_empty() {
+            stream.write_all(buf).await?;
+        }
+
+        // Flush immediately to reduce latency
+        stream.flush().await?;
+
         Ok(buf.len())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        debug!("TcpTransport::recv_from called");
+        trace!("TcpTransport::recv_from called");
 
-        let remote_addr = {
-            let remote_addr_guard = self.remote_addr.lock().await;
-            match remote_addr_guard.as_ref() {
-                Some(addr) => {
-                    debug!("Remote address found: {}", addr);
-                    *addr
-                }
-                None => {
-                    error!("No remote address stored in TcpTransport");
-                    anyhow::bail!("No remote address stored");
-                }
-            }
-        };
+        // Use cached remote address to avoid locking
+        let remote_addr = self.cached_remote_addr;
 
         // Try to read a complete frame from the buffer
         let message = {
             let mut buffer = self.read_buffer.lock().await;
-            let mut stream_guard = self.stream.lock().await;
-            let stream = stream_guard.as_mut().ok_or_else(|| anyhow::anyhow!("No active TCP connection"))?;
 
-            let mut temp_buf = [0u8; 4096];
+            // Try to read from buffer first without holding stream lock
+            if let Some(msg) = self.try_read_from_buffer(&mut buffer)? {
+                return Ok((self.copy_to_buffer(&msg, buf), remote_addr));
+            }
 
-            // Read until we have at least 4 bytes for length prefix
-            while buffer.len() < 4 {
-                let n = stream.read(&mut temp_buf).await?;
-                if n == 0 {
-                    anyhow::bail!("Connection closed");
+            // Need to read from stream
+            // Now read data into buffer
+            self.read_stream_data(&mut buffer).await?;
+
+            // Try again to read from buffer
+            match self.try_read_from_buffer(&mut buffer)? {
+                Some(msg) => msg,
+                None => {
+                    // If we still don't have a complete frame, read more
+                    self.read_stream_data(&mut buffer).await?;
+                    self.try_read_from_buffer(&mut buffer)?
+                        .ok_or_else(|| anyhow::anyhow!("Failed to read complete frame"))?
                 }
-                buffer.extend_from_slice(&temp_buf[..n]);
             }
-
-            // Parse message length
-            let msg_len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-
-            // Check if message length is reasonable
-            if msg_len > TUN_MTU + VpnPacket::HEADER_SIZE {
-                anyhow::bail!("Message too large: {}", msg_len);
-            }
-
-            // Read until we have the complete message
-            while buffer.len() < 4 + msg_len {
-                let n = stream.read(&mut temp_buf).await?;
-                if n == 0 {
-                    anyhow::bail!("Connection closed");
-                }
-                buffer.extend_from_slice(&temp_buf[..n]);
-            }
-
-            // Extract the message (without length prefix)
-            let message = buffer[4..4 + msg_len].to_vec();
-
-            // Remove the consumed data from buffer
-            buffer.drain(0..4 + msg_len);
-
-            message
         };
 
         // Copy to output buffer
-        let len = std::cmp::min(message.len(), buf.len());
-        buf[..len].copy_from_slice(&message[..len]);
+        let len = self.copy_to_buffer(&message, buf);
 
         Ok((len, remote_addr))
     }
