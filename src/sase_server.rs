@@ -395,33 +395,37 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            if let Err(e) = result {
-                error!("Failed to wait for Ctrl+C: {}", e);
-            }
-            info!("Shutting down server...");
-            tun_handle.abort();
-            tcp_send_handle.abort();
-        }
-        result = TcpTransport::accept(&config.bind_addr) => {
-            match result {
+    // Start TCP accept loop in a separate task
+    let clients_clone = Arc::clone(&clients);
+    let tun_tx_clone = transport_to_tun_tx.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            match TcpTransport::accept(&config.bind_addr).await {
                 Ok(tcp_transport) => {
                     let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
-                    let _transport_handle = tokio::spawn(
-                        tcp_recv_io_task(
-                            Arc::clone(&transport),
-                            Arc::clone(&clients),
-                            transport_to_tun_tx.clone()
-                        )
-                    );
+                    let clients = Arc::clone(&clients_clone);
+                    let tun_tx = tun_tx_clone.clone();
+                    tokio::spawn(async move {
+                        tcp_recv_io_task(transport, clients, tun_tx).await;
+                    });
                 }
                 Err(e) => {
                     error!("Failed to accept TCP connection: {}", e);
+                    break;
                 }
             }
         }
+    });
+
+    // Wait for Ctrl+C to shutdown
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        error!("Failed to wait for Ctrl+C: {}", e);
     }
+    info!("Shutting down server...");
+
+    tun_handle.abort();
+    tcp_send_handle.abort();
+    accept_task.abort();
 
     Ok(())
 }
