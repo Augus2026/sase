@@ -85,30 +85,21 @@ impl Transport for TcpTransport {
             }
         };
 
-        // Helper function to read data into buffer
-        let read_data = || async {
-            let mut stream_guard = self.stream.lock().await;
-            let stream = stream_guard.as_mut().ok_or_else(|| anyhow::anyhow!("No active TCP connection"))?;
-
-            // Use a temporary buffer for bulk reading
-            let mut temp_buf = vec![0u8; 4096];
-            let n = stream.read(&mut temp_buf).await?;
-
-            if n == 0 {
-                anyhow::bail!("Connection closed");
-            }
-
-            Ok::<Vec<u8>, anyhow::Error>(temp_buf[..n].to_vec())
-        };
-
         // Try to read a complete frame from the buffer
         let message = {
             let mut buffer = self.read_buffer.lock().await;
+            let mut stream_guard = self.stream.lock().await;
+            let stream = stream_guard.as_mut().ok_or_else(|| anyhow::anyhow!("No active TCP connection"))?;
 
-            // Read length prefix if not enough data
+            let mut temp_buf = [0u8; 4096];
+
+            // Read until we have at least 4 bytes for length prefix
             while buffer.len() < 4 {
-                let data = read_data().await?;
-                buffer.extend_from_slice(&data);
+                let n = stream.read(&mut temp_buf).await?;
+                if n == 0 {
+                    anyhow::bail!("Connection closed");
+                }
+                buffer.extend_from_slice(&temp_buf[..n]);
             }
 
             // Parse message length
@@ -119,10 +110,13 @@ impl Transport for TcpTransport {
                 anyhow::bail!("Message too large: {}", msg_len);
             }
 
-            // Read message body
+            // Read until we have the complete message
             while buffer.len() < 4 + msg_len {
-                let data = read_data().await?;
-                buffer.extend_from_slice(&data);
+                let n = stream.read(&mut temp_buf).await?;
+                if n == 0 {
+                    anyhow::bail!("Connection closed");
+                }
+                buffer.extend_from_slice(&temp_buf[..n]);
             }
 
             // Extract the message (without length prefix)
