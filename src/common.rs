@@ -152,10 +152,10 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
     let dst_ip = std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
 
     let proto_name = match protocol {
-        1 => "ICMP",
-        6 => "TCP",
-        17 => "UDP",
-        _ => "Other",
+        1 => "ICMP".to_string(),
+        6 => "TCP".to_string(),
+        17 => "UDP".to_string(),
+        _ => format!("Unknown({})", protocol),
     };
     debug!("{}: {} {} -> {} ({} bytes)", prefix, proto_name, src_ip, dst_ip, data.len());
 
@@ -212,7 +212,14 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
                 debug!("  └─ UDP {} -> {} | length={}", src_port, dst_port, length);
             }
         }
-        _ => {}
+        _ => {
+            // Unknown protocol - dump first 32 bytes for debugging
+            let hex_dump: Vec<String> = data.iter()
+                .take(32)
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            debug!("  └─ Raw header bytes: {}", hex_dump.join(" "));
+        }
     }
 }
 
