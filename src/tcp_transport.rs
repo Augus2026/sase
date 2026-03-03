@@ -16,6 +16,10 @@ pub struct TcpTransport {
 impl TcpTransport {
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+
+        // Disable Nagle's algorithm to reduce latency for small packets
+        stream.set_nodelay(true)?;
+
         info!("TCP connection established to {}", addr);
 
         let transport = Self {
@@ -32,6 +36,10 @@ impl TcpTransport {
         info!("TCP server listening on {}", bind_addr);
 
         let (stream, addr) = listener.accept().await?;
+
+        // Disable Nagle's algorithm to reduce latency for small packets
+        stream.set_nodelay(true)?;
+
         info!("TCP connection accepted from {}", addr);
 
         let transport = Self {
@@ -77,16 +85,20 @@ impl Transport for TcpTransport {
             }
         };
 
-        // Helper function to read one byte
-        let read_byte = || async {
+        // Helper function to read data into buffer
+        let read_data = || async {
             let mut stream_guard = self.stream.lock().await;
             let stream = stream_guard.as_mut().ok_or_else(|| anyhow::anyhow!("No active TCP connection"))?;
-            let mut byte_buf = [0u8; 1];
-            let n = stream.read(&mut byte_buf).await?;
+
+            // Use a temporary buffer for bulk reading
+            let mut temp_buf = vec![0u8; 4096];
+            let n = stream.read(&mut temp_buf).await?;
+
             if n == 0 {
                 anyhow::bail!("Connection closed");
             }
-            Ok::<u8, anyhow::Error>(byte_buf[0])
+
+            Ok::<Vec<u8>, anyhow::Error>(temp_buf[..n].to_vec())
         };
 
         // Try to read a complete frame from the buffer
@@ -95,8 +107,8 @@ impl Transport for TcpTransport {
 
             // Read length prefix if not enough data
             while buffer.len() < 4 {
-                let byte = read_byte().await?;
-                buffer.push(byte);
+                let data = read_data().await?;
+                buffer.extend_from_slice(&data);
             }
 
             // Parse message length
@@ -109,8 +121,8 @@ impl Transport for TcpTransport {
 
             // Read message body
             while buffer.len() < 4 + msg_len {
-                let byte = read_byte().await?;
-                buffer.push(byte);
+                let data = read_data().await?;
+                buffer.extend_from_slice(&data);
             }
 
             // Extract the message (without length prefix)
