@@ -226,14 +226,14 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
 pub async fn tun_io_task(
     mut tun: tun2::AsyncDevice,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    mut udp_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut transport_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     let mut tun_buf = vec![0u8; TUN_MTU];
     info!("TUN I/O task started");
 
     loop {
         tokio::select! {
-            result = udp_rx.recv() => {
+            result = transport_rx.recv() => {
                 match result {
                     Some(data) => {
                         print_packet_info("[tun write]", &data);
@@ -254,7 +254,7 @@ pub async fn tun_io_task(
                         let data = tun_buf[..n].to_vec();
                         print_packet_info("[tun read]", &data);
                         if let Err(e) = tun_tx.send(data).await {
-                            error!("TUN I/O: Failed to send to UDP: {}", e);
+                            error!("TUN I/O: Failed to send to transport: {}", e);
                             break;
                         }
                     }

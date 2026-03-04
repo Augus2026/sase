@@ -69,7 +69,7 @@ async fn transport_io_task(
     server_addr: std::net::SocketAddr,
     client_id: u32,
     mut tun_rx: mpsc::Receiver<Vec<u8>>,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    transport_tx: mpsc::Sender<Vec<u8>>,
 ) {
     let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
     let mut keepalive_interval = interval(Duration::from_secs(10));
@@ -104,7 +104,7 @@ async fn transport_io_task(
 
                                         if payload_end <= n {
                                             let payload = transport_buf[payload_start..payload_end].to_vec();
-                                            if let Err(e) = tun_tx.send(payload).await {
+                                            if let Err(e) = transport_tx.send(payload).await {
                                                 error!("Transport: Failed to send to TUN: {}", e);
                                                 break;
                                             }
@@ -198,14 +198,14 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
     let client_id = handshake_async(transport.as_ref(), config.server_addr).await?;
     info!("Client {} ready, tunnel established to {}", client_id, config.server_addr);
 
-    let (tun_to_transport_tx, tun_to_transport_rx) = mpsc::channel::<Vec<u8>>(4096);
-    let (transport_to_tun_tx, transport_to_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
-            tun_to_transport_tx,
-            transport_to_tun_rx
+            tun_tx,
+            transport_rx
         )
     );
     let transport_handle = tokio::spawn(
@@ -213,8 +213,8 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             Arc::clone(&transport),
             config.server_addr,
             client_id,
-            tun_to_transport_rx,
-            transport_to_tun_tx,
+            tun_rx,
+            transport_tx,
         )
     );
     info!("Client {} is running, press Ctrl+C to stop", client_id);

@@ -275,22 +275,22 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     let udp_transport = UdpTransport::new(config.bind_addr)?;
     let transport: Arc<dyn Transport> = Arc::new(udp_transport);
 
-    let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
-            tun_to_transport_tx,
-            transport_to_tun_rx
+            tun_tx,
+            transport_rx
         )
     );
     let transport_handle = tokio::spawn(
         transport_io_task(
             Arc::clone(&transport),
             Arc::clone(&clients),
-            tun_to_transport_rx,
-            transport_to_tun_tx
+            tun_rx,
+            transport_tx
         )
     );
 
@@ -371,28 +371,28 @@ async fn tcp_recv_io_task(
 }
 
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let (tun_to_transport_tx, tun_to_transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let (transport_to_tun_tx, transport_to_tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
 
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
-            tun_to_transport_tx,
-            transport_to_tun_rx
+            tun_tx,
+            transport_rx
         )
     );
 
     let tcp_send_handle = tokio::spawn(
         tcp_send_io_task(
             Arc::clone(&clients),
-            tun_to_transport_rx
+            tun_rx
         )
     );
 
     // Start TCP accept loop in a separate task
     let clients_clone = Arc::clone(&clients);
-    let tun_tx_clone = transport_to_tun_tx.clone();
+    let tun_tx_clone = transport_tx.clone();
     let accept_task = tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(&config.bind_addr).await {
             Ok(l) => {
