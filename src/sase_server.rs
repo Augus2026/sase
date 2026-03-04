@@ -68,7 +68,7 @@ async fn handle_handshake(
 async fn handle_data(
     header: &VpnPacket,
     data: &[u8],
-    tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> bool {
     let payload_start = VpnPacket::HEADER_SIZE;
     let payload_end = payload_start + header.length as usize;
@@ -76,8 +76,8 @@ async fn handle_data(
     if payload_end <= data.len() {
         let payload = data[payload_start..payload_end].to_vec();
         print_packet_info("[transport read]", &payload);
-        if let Err(e) = tun_tx.send(payload).await {
-            error!("Failed to send to TUN writer: {}", e);
+        if let Err(e) = transport_tx.send(payload).await {
+            error!("Failed to send to transport writer: {}", e);
             true
         } else {
             false
@@ -161,14 +161,14 @@ async fn handle_message(
     transport: Arc<dyn Transport>,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     next_client_id: &mut u32,
-    tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     match header.packet_type {
         PacketType::Handshake => {
             handle_handshake(src_addr, Arc::clone(&transport), clients, next_client_id).await;
         }
         PacketType::Data => {
-            handle_data(&header, data, tun_tx).await;
+            handle_data(&header, data, transport_tx).await;
         }
         PacketType::KeepAlive => {
             handle_keepalive(&header, src_addr, transport.as_ref()).await;
@@ -183,7 +183,7 @@ async fn transport_io_task(
     transport: Arc<dyn Transport>,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
     mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
     let mut next_client_id = 2u32;
@@ -208,7 +208,7 @@ async fn transport_io_task(
                                     Arc::clone(&transport),
                                     &clients,
                                     &mut next_client_id,
-                                    &tun_tx,
+                                    &transport_tx,
                                 ).await;
                             }
                             Err(e) => {
@@ -394,7 +394,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     let clients_clone = Arc::clone(&clients);
     let tun_tx_clone = transport_tx.clone();
     let accept_task = tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(&config.bind_addr).await {
+        let mut listener = match tokio::net::TcpListener::bind(&config.bind_addr).await {
             Ok(l) => {
                 info!("TCP server listening on {}", config.bind_addr);
                 l
@@ -404,34 +404,18 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                 return;
             }
         };
-
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    // Disable Nagle's algorithm to reduce latency for small packets
-                    if let Err(e) = stream.set_nodelay(true) {
-                        error!("Failed to set TCP_NODELAY: {}", e);
-                        continue;
-                    }
-                    info!("TCP connection accepted from {}", addr);
-
-                    match TcpTransport::from_stream(stream, addr) {
-                        Ok(tcp_transport) => {
-                            let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
-                            let clients = Arc::clone(&clients_clone);
-                            let tun_tx = tun_tx_clone.clone();
-                            tokio::spawn(async move {
-                                tcp_recv_io_task(transport, clients, tun_tx).await;
-                            });
-                        }
-                        Err(e) => {
-                            error!("Failed to create TCP transport: {}", e);
-                        }
-                    }
+            match TcpTransport::accept(&mut listener).await {
+                Ok(tcp_transport) => {
+                    let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
+                    let clients = Arc::clone(&clients_clone);
+                    let tun_tx = tun_tx_clone.clone();
+                    tokio::spawn(async move {
+                        tcp_recv_io_task(transport, clients, tun_tx).await;
+                    });
                 }
                 Err(e) => {
-                    error!("Failed to accept TCP connection: {}", e);
-                    break;
+                    error!("Failed to create TCP transport: {}", e);
                 }
             }
         }

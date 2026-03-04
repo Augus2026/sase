@@ -5,7 +5,7 @@ use log::{info, trace};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 pub struct TcpTransport {
     stream: Arc<tokio::sync::Mutex<Option<TcpStream>>>,
@@ -32,7 +32,10 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    pub fn from_stream(stream: TcpStream, remote_addr: SocketAddr) -> Result<Self> {
+    pub async fn accept(tcp_acceptor: &mut TcpListener) -> Result<Self> {
+        let (stream, remote_addr) = tcp_acceptor.accept().await?;
+        stream.set_nodelay(true)?;
+
         let transport = Self {
             stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
             cached_remote_addr: remote_addr,
