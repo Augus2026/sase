@@ -232,7 +232,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await?;
     info!("TCP server listening on {}", config.bind_addr);
 
     let clients_clone = Arc::clone(&clients);
@@ -240,9 +240,9 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     let accept_task = tokio::spawn(async move {
         let mut next_client_id = 2u32;
         loop {
-            match listener.accept().await {
-                Ok((socket, _addr)) => {
-                    let mut tcp_transport = TcpTransport::new(socket).unwrap();
+            match TcpTransport::accept(&listener).await {
+                Ok(mut tcp_transport) => {
+                    let peer_addr = tcp_transport.peer_addr();
                     let peer_addr = tcp_transport.peer_addr();
                     info!("New TCP connection from {}", peer_addr);
 
