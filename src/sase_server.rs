@@ -50,6 +50,41 @@ async fn handle_disconnect(
     }
 }
 
+async fn handle_handshake(
+    msg: Message,
+    transport: &mut TcpTransport,
+    peer_addr: SocketAddr,
+    client_id: u32,
+    clients: Arc<Mutex<HashMap<u32, Client>>>,
+) -> Result<bool> {
+    if msg.message_type != MessageType::Handshake as u8 {
+        warn!("Expected handshake message, got type: {}", msg.message_type);
+        return Ok(false);
+    }
+
+    let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
+    let response_data = client_id.to_be_bytes().to_vec();
+    let message = Message::handshake(response_data);
+
+    if let Err(e) = transport.send(message, peer_addr).await {
+        error!("Failed to send handshake response: {}", e);
+        return Ok(false);
+    }
+
+    let client = Client {
+        addr: peer_addr,
+        virtual_ip,
+    };
+
+    {
+        let mut clients_map = clients.lock().await;
+        clients_map.insert(client_id, client.clone());
+    }
+
+    info!("Client {} connected from {}, assigned IP: {}", client_id, peer_addr, virtual_ip);
+    Ok(true)
+}
+
 fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
     if data.len() < 20 {
         return None;
@@ -241,73 +276,79 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         let mut next_client_id = 2u32;
         loop {
             match TcpTransport::accept(&listener).await {
-                Ok(mut tcp_transport) => {
-                    let peer_addr = tcp_transport.peer_addr();
+                Ok(tcp_transport) => {
                     let peer_addr = tcp_transport.peer_addr();
                     info!("New TCP connection from {}", peer_addr);
 
-                    // Handshake
-                    let virtual_ip = Ipv4Addr::new(10, 0, 0, next_client_id as u8);
-                    let response_data = next_client_id.to_be_bytes().to_vec();
-                    let message = Message::handshake(response_data);
-
-                    if let Err(e) = tcp_transport.send(message, peer_addr).await {
-                        error!("Failed to send handshake: {}", e);
-                        continue;
-                    }
-
-                    let client = Client {
-                        addr: peer_addr,
-                        virtual_ip,
-                    };
-
-                    {
-                        let mut clients_map = clients_clone.lock().await;
-                        clients_map.insert(next_client_id, client.clone());
-                    }
-
-                    info!("Client {} connected from {}, assigned IP: {}", next_client_id, peer_addr, virtual_ip);
                     let client_id = next_client_id;
                     next_client_id = next_client_id.wrapping_add(1);
 
-                    // Spawn connection handler
                     let transport_tx_clone = transport_tx_for_accept.clone();
                     let clients_clone_clone = Arc::clone(&clients_clone);
+
+                    // Spawn connection handler
                     tokio::spawn(async move {
-                        loop {
-                            match tcp_transport.next().await {
-                                Some(Ok((msg, _addr))) => {
-                                    match msg.message_type {
-                                        t if t == MessageType::Data as u8 => {
-                                            // Data message contains raw IP packet
-                                            print_packet_info("[transport read]", &msg.data);
-                                            if let Err(e) = transport_tx_clone.send(msg.data).await {
-                                                error!("Failed to send to TUN: {}", e);
-                                                break;
+                        let mut tcp_transport = tcp_transport;
+                        let peer_addr = tcp_transport.peer_addr();
+
+                        // 等待客户端的handshake消息
+                        match tcp_transport.next().await {
+                            Some(Ok((msg, _))) => {
+                                let handshake_success = handle_handshake(
+                                    msg,
+                                    &mut tcp_transport,
+                                    peer_addr,
+                                    client_id,
+                                    clients_clone_clone,
+                                ).await;
+
+                                if !handshake_success.unwrap_or(false) {
+                                    return;
+                                }
+
+                                // 处理后续消息
+                                loop {
+                                    match tcp_transport.next().await {
+                                        Some(Ok((msg, _addr))) => {
+                                            match msg.message_type {
+                                                t if t == MessageType::Data as u8 => {
+                                                    // Data message contains raw IP packet
+                                                    print_packet_info("[transport read]", &msg.data);
+                                                    if let Err(e) = transport_tx_clone.send(msg.data).await {
+                                                        error!("Failed to send to TUN: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                                t if t == MessageType::KeepAlive as u8 => {
+                                                    let response = Message::keepalive(vec![]);
+                                                    if let Err(e) = tcp_transport.send(response, peer_addr).await {
+                                                        warn!("Failed to send keepalive response: {}", e);
+                                                    }
+                                                }
+                                                t if t == MessageType::Disconnect as u8 => {
+                                                    let mut clients_map = clients_clone_clone.lock().await;
+                                                    clients_map.remove(&client_id);
+                                                    info!("Client {} disconnected", client_id);
+                                                    break;
+                                                }
+                                                _ => {}
                                             }
                                         }
-                                        t if t == MessageType::KeepAlive as u8 => {
-                                            let response = Message::keepalive(vec![]);
-                                            if let Err(e) = tcp_transport.send(response, peer_addr).await {
-                                                warn!("Failed to send keepalive response: {}", e);
-                                            }
-                                        }
-                                        t if t == MessageType::Disconnect as u8 => {
-                                            let mut clients_map = clients_clone_clone.lock().await;
-                                            clients_map.remove(&client_id);
-                                            info!("Client {} disconnected", client_id);
+                                        Some(Err(e)) => {
+                                            error!("Error reading message: {}", e);
                                             break;
                                         }
-                                        _ => {}
+                                        None => {
+                                            break;
+                                        }
                                     }
                                 }
-                                Some(Err(e)) => {
-                                    error!("Error reading message: {}", e);
-                                    break;
-                                }
-                                None => {
-                                    break;
-                                }
+                            }
+                            Some(Err(e)) => {
+                                error!("Error reading handshake: {}", e);
+                            }
+                            None => {
+                                info!("Client disconnected before handshake");
                             }
                         }
                     });
