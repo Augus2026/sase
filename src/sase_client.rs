@@ -1,4 +1,4 @@
-use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task};
+use crate::common::{ClientConfig, PacketType, VpnPacket, TUN_MTU, tun_io_task, print_packet_info};
 use crate::transport::Transport;
 use crate::tcp_transport::TcpTransport;
 use crate::udp_transport::UdpTransport;
@@ -104,6 +104,8 @@ async fn transport_io_task(
 
                                         if payload_end <= n {
                                             let payload = transport_buf[payload_start..payload_end].to_vec();
+
+                                            print_packet_info("[transport recv]", &payload);
                                             if let Err(e) = transport_tx.send(payload).await {
                                                 error!("Transport: Failed to send to TUN: {}", e);
                                                 break;
@@ -142,6 +144,7 @@ async fn transport_io_task(
                         send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
                         send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
 
+                        print_packet_info("[transport send]", &data);
                         if let Err(e) = transport.send_to(&send_buf, server_addr).await {
                             warn!("Transport: Failed to send to server: {}", e);
                         }

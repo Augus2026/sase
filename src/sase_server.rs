@@ -327,7 +327,7 @@ async fn tcp_send_io_task(
     }
 }
 
-async fn handle_client(
+async fn handle_connection(
     transport: Arc<dyn Transport>,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -411,7 +411,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                     let clients = Arc::clone(&clients_clone);
                     let tun_tx = tun_tx_clone.clone();
                     tokio::spawn(async move {
-                        handle_client(transport, clients, tun_tx).await;
+                        handle_connection(transport, clients, tun_tx).await;
                     });
                 }
                 Err(e) => {
