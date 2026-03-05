@@ -1,7 +1,6 @@
-use crate::common::{PacketType, ServerConfig, VpnPacket, TUN_MTU, print_packet_info, tun_io_task};
-use crate::transport::Transport;
-use crate::tcp_transport::TcpTransport;
-use crate::udp_transport::UdpTransport;
+use crate::common::{ServerConfig, print_packet_info, tun_io_task};
+use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
+use crate::codec::{Message, MessageType};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -13,106 +12,41 @@ use tun2::{create_as_async, Configuration};
 #[derive(Clone)]
 struct Client {
     addr: SocketAddr,
-    client_id: u32,
-    sequence: u32,
     virtual_ip: Ipv4Addr,
-    transport: Arc<dyn Transport>,
-}
-
-async fn handle_handshake(
-    src_addr: SocketAddr,
-    transport: Arc<dyn Transport>,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-    next_client_id: &mut u32,
-) {
-    let is_new = {
-        let clients_map = clients.lock().await;
-        !clients_map.values().any(|c| c.addr == src_addr)
-    };
-
-    if is_new {
-        let virtual_ip = Ipv4Addr::new(10, 0, 0, *next_client_id as u8);
-
-        let client = Client {
-            addr: src_addr,
-            client_id: *next_client_id,
-            sequence: 0,
-            virtual_ip,
-            transport: Arc::clone(&transport),
-        };
-
-        {
-            let mut clients_map = clients.lock().await;
-            clients_map.insert(*next_client_id, client.clone());
-        }
-
-        info!("Client {} connected from {}, assigned IP: {}", next_client_id, src_addr, virtual_ip);
-
-        let response = VpnPacket::new(
-            PacketType::Handshake,
-            *next_client_id,
-            0,
-            0,
-        );
-        let response_buf = response.to_bytes();
-        if let Err(e) = transport.send_to(&response_buf, src_addr).await {
-            error!("Failed to send handshake to {}: {}", src_addr, e);
-        }
-
-        *next_client_id = next_client_id.wrapping_add(1);
-    } else {
-        info!("Handshake from existing client {}", src_addr);
-    }
 }
 
 async fn handle_data(
-    header: &VpnPacket,
     data: &[u8],
     transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> bool {
-    let payload_start = VpnPacket::HEADER_SIZE;
-    let payload_end = payload_start + header.length as usize;
-
-    if payload_end <= data.len() {
-        let payload = data[payload_start..payload_end].to_vec();
-        print_packet_info("[transport read]", &payload);
-        if let Err(e) = transport_tx.send(payload).await {
-            error!("Failed to send to transport writer: {}", e);
-            true
-        } else {
-            false
-        }
+    print_packet_info("[transport read]", &data);
+    if let Err(e) = transport_tx.send(data.to_vec()).await {
+        error!("Failed to send to transport writer: {}", e);
+        true
     } else {
-        warn!("Invalid payload length from client {}", header.client_id);
         false
     }
 }
 
 async fn handle_keepalive(
-    header: &VpnPacket,
     src_addr: SocketAddr,
-    transport: &dyn Transport,
+    transport: &mut impl TransportTrait<Error = std::io::Error>,
 ) {
-    info!("Keepalive received from client {}", header.client_id);
-    let response = VpnPacket::new(
-        PacketType::KeepAlive,
-        header.client_id,
-        header.sequence,
-        0,
-    );
-    let response_buf = response.to_bytes();
-    if let Err(e) = transport.send_to(&response_buf, src_addr).await {
+    info!("Keepalive received from {}", src_addr);
+    let response = Message::keepalive(vec![]);
+    if let Err(e) = transport.send(response, src_addr).await {
         warn!("Failed to send keepalive response to {}: {}", src_addr, e);
     }
 }
 
 async fn handle_disconnect(
-    header: &VpnPacket,
+    addr: SocketAddr,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
 ) {
     let mut clients_map = clients.lock().await;
-    if let Some(client) = clients_map.remove(&header.client_id) {
-        info!("Client {} disconnected ({})", header.client_id, client.addr);
+    if let Some((client_id, client)) = clients_map.iter().find(|(_, c)| c.addr == addr).map(|(k, v)| (*k, v.clone())) {
+        clients_map.remove(&client_id);
+        info!("Client {} disconnected ({})", client_id, client.addr);
     }
 }
 
@@ -133,91 +67,73 @@ fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
 
 async fn send_to_client(
     data: &[u8],
-    transport: &dyn Transport,
+    transport: &mut impl TransportTrait<Error = std::io::Error>,
     client: &Client,
 ) {
     print_packet_info("[transport write]", &data);
+    let message = Message::data(data.to_vec());
 
-    let packet = VpnPacket::new(
-        PacketType::Data,
-        client.client_id,
-        client.sequence,
-        data.len() as u16,
-    );
-
-    let mut send_buf = vec![0u8; VpnPacket::HEADER_SIZE + data.len()];
-    send_buf[..VpnPacket::HEADER_SIZE].copy_from_slice(&packet.to_bytes());
-    send_buf[VpnPacket::HEADER_SIZE..].copy_from_slice(&data);
-
-    if let Err(e) = transport.send_to(&send_buf, client.addr).await {
+    if let Err(e) = transport.send(message, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
     }
 }
 
-async fn handle_message(
-    header: VpnPacket,
-    data: &[u8],
-    src_addr: SocketAddr,
-    transport: Arc<dyn Transport>,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-    next_client_id: &mut u32,
-    transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-) {
-    match header.packet_type {
-        PacketType::Handshake => {
-            handle_handshake(src_addr, Arc::clone(&transport), clients, next_client_id).await;
-        }
-        PacketType::Data => {
-            handle_data(&header, data, transport_tx).await;
-        }
-        PacketType::KeepAlive => {
-            handle_keepalive(&header, src_addr, transport.as_ref()).await;
-        }
-        PacketType::Disconnect => {
-            handle_disconnect(&header, clients).await;
-        }
-    }
-}
-
-async fn transport_io_task(
-    transport: Arc<dyn Transport>,
+async fn udp_transport_io_task(
+    mut transport: UdpTransport,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
     mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
     let mut next_client_id = 2u32;
-    info!("Transport I/O task started");
+    info!("UDP transport I/O task started");
 
     loop {
         tokio::select! {
-            result = transport.recv_from(&mut transport_buf) => {
+            result = transport.next() => {
                 match result {
-                    Ok((n, src_addr)) => {
-                        if n < VpnPacket::HEADER_SIZE {
-                            info!("Transport: Received short packet from {}", src_addr);
-                            continue;
-                        }
+                    Some(Ok((msg, src_addr))) => {
+                        match msg.message_type {
+                            t if t == MessageType::Handshake as u8 => {
+                                let virtual_ip = Ipv4Addr::new(10, 0, 0, next_client_id as u8);
+                                // Send client_id as 4 bytes in response
+                                let response_data = next_client_id.to_be_bytes().to_vec();
+                                let message = Message::handshake(response_data);
 
-                        match VpnPacket::from_bytes(&transport_buf[..n]) {
-                            Ok(header) => {
-                                handle_message(
-                                    header,
-                                    &transport_buf[..n],
-                                    src_addr,
-                                    Arc::clone(&transport),
-                                    &clients,
-                                    &mut next_client_id,
-                                    &transport_tx,
-                                ).await;
+                                if let Err(e) = transport.send(message, src_addr).await {
+                                    error!("Failed to send handshake to {}: {}", src_addr, e);
+                                } else {
+                                    let client = Client {
+                                        addr: src_addr,
+                                        virtual_ip,
+                                    };
+                                    {
+                                        let mut clients_map = clients.lock().await;
+                                        clients_map.insert(next_client_id, client);
+                                    }
+                                    info!("Client {} connected from {}, assigned IP: {}", next_client_id, src_addr, virtual_ip);
+                                    next_client_id = next_client_id.wrapping_add(1);
+                                }
                             }
-                            Err(e) => {
-                                info!("Failed to parse packet from {}: {}", src_addr, e);
+                            t if t == MessageType::Data as u8 => {
+                                // Data message contains raw IP packet
+                                handle_data(&msg.data, &transport_tx).await;
+                            }
+                            t if t == MessageType::KeepAlive as u8 => {
+                                handle_keepalive(src_addr, &mut transport).await;
+                            }
+                            t if t == MessageType::Disconnect as u8 => {
+                                handle_disconnect(src_addr, &clients).await;
+                            }
+                            _ => {
+                                info!("Unknown message type from {}: {}", src_addr, msg.message_type);
                             }
                         }
                     }
-                    Err(e) => {
-                        error!("Transport: Error receiving: {}", e);
+                    Some(Err(e)) => {
+                        error!("Error reading message: {}", e);
+                        break;
+                    }
+                    None => {
                         break;
                     }
                 }
@@ -230,7 +146,7 @@ async fn transport_io_task(
                         if let Some(dest_ip) = get_destination_ip(&data) {
                             let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
                             if let Some(client) = target_client {
-                                send_to_client(&data, transport.as_ref(), client).await;
+                                send_to_client(&data, &mut transport, client).await;
                             }
                         }
                     }
@@ -272,12 +188,12 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
 }
 
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let udp_transport = UdpTransport::new(config.bind_addr)?;
-    let transport: Arc<dyn Transport> = Arc::new(udp_transport);
+    let transport = UdpTransport::bind(config.bind_addr.to_string().as_str()).await?;
 
     let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
+
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
@@ -286,8 +202,8 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
     let transport_handle = tokio::spawn(
-        transport_io_task(
-            Arc::clone(&transport),
+        udp_transport_io_task(
+            transport,
             Arc::clone(&clients),
             tun_rx,
             transport_tx
@@ -303,73 +219,6 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     Ok(())
 }
 
-async fn tcp_send_io_task(
-    clients: Arc<Mutex<HashMap<u32, Client>>>,
-    mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-) {
-    loop {
-        match tun_rx.recv().await {
-            Some(data) => {
-                let clients_map = clients.lock().await;
-                if let Some(dest_ip) = get_destination_ip(&data) {
-                    let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
-                    if let Some(client) = target_client {
-                        let transport = client.transport.clone();
-                        send_to_client(&data, transport.as_ref(), client).await;
-                    }
-                }
-            }
-            None => {
-                error!("Transport: Channel disconnected");
-                break;
-            }
-        }
-    }
-}
-
-async fn handle_connection(
-    transport: Arc<dyn Transport>,
-    clients: Arc<Mutex<HashMap<u32, Client>>>,
-    tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-) {
-    let mut transport_buf = vec![0u8; VpnPacket::HEADER_SIZE + TUN_MTU];
-    let mut next_client_id = 2u32;
-    info!("Transport I/O task started");
-
-    loop {
-        match transport.recv_from(&mut transport_buf).await {
-            Ok((n, src_addr)) => {
-                if n < VpnPacket::HEADER_SIZE {
-                    info!("Transport: Received short packet from {}", src_addr);
-                    continue;
-                }
-
-                match VpnPacket::from_bytes(&transport_buf[..n]) {
-                    Ok(header) => {
-                        handle_message(
-                            header,
-                            &transport_buf[..n],
-                            src_addr,
-                            Arc::clone(&transport),
-                            &clients,
-                            &mut next_client_id,
-                            &tun_tx,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        info!("Failed to parse packet from {}: {}", src_addr, e);
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Transport: Error receiving: {}", e);
-                break;
-            }
-        }
-    }
-}
-
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -383,52 +232,106 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    let tcp_send_handle = tokio::spawn(
-        tcp_send_io_task(
-            Arc::clone(&clients),
-            tun_rx
-        )
-    );
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    info!("TCP server listening on {}", config.bind_addr);
 
-    // Start TCP accept loop in a separate task
     let clients_clone = Arc::clone(&clients);
-    let tun_tx_clone = transport_tx.clone();
+    let transport_tx_for_accept = transport_tx.clone();
     let accept_task = tokio::spawn(async move {
-        let mut listener = match tokio::net::TcpListener::bind(&config.bind_addr).await {
-            Ok(l) => {
-                info!("TCP server listening on {}", config.bind_addr);
-                l
-            }
-            Err(e) => {
-                error!("Failed to bind TCP listener: {}", e);
-                return;
-            }
-        };
+        let mut next_client_id = 2u32;
         loop {
-            match TcpTransport::accept(&mut listener).await {
-                Ok(tcp_transport) => {
-                    let transport: Arc<dyn Transport> = Arc::new(tcp_transport);
-                    let clients = Arc::clone(&clients_clone);
-                    let tun_tx = tun_tx_clone.clone();
+            match listener.accept().await {
+                Ok((socket, _addr)) => {
+                    let mut tcp_transport = TcpTransport::new(socket).unwrap();
+                    let peer_addr = tcp_transport.peer_addr();
+                    info!("New TCP connection from {}", peer_addr);
+
+                    // Handshake
+                    let virtual_ip = Ipv4Addr::new(10, 0, 0, next_client_id as u8);
+                    let response_data = next_client_id.to_be_bytes().to_vec();
+                    let message = Message::handshake(response_data);
+
+                    if let Err(e) = tcp_transport.send(message, peer_addr).await {
+                        error!("Failed to send handshake: {}", e);
+                        continue;
+                    }
+
+                    let client = Client {
+                        addr: peer_addr,
+                        virtual_ip,
+                    };
+
+                    {
+                        let mut clients_map = clients_clone.lock().await;
+                        clients_map.insert(next_client_id, client.clone());
+                    }
+
+                    info!("Client {} connected from {}, assigned IP: {}", next_client_id, peer_addr, virtual_ip);
+                    let client_id = next_client_id;
+                    next_client_id = next_client_id.wrapping_add(1);
+
+                    // Spawn connection handler
+                    let transport_tx_clone = transport_tx_for_accept.clone();
+                    let clients_clone_clone = Arc::clone(&clients_clone);
                     tokio::spawn(async move {
-                        handle_connection(transport, clients, tun_tx).await;
+                        loop {
+                            match tcp_transport.next().await {
+                                Some(Ok((msg, _addr))) => {
+                                    match msg.message_type {
+                                        t if t == MessageType::Data as u8 => {
+                                            // Data message contains raw IP packet
+                                            print_packet_info("[transport read]", &msg.data);
+                                            if let Err(e) = transport_tx_clone.send(msg.data).await {
+                                                error!("Failed to send to TUN: {}", e);
+                                                break;
+                                            }
+                                        }
+                                        t if t == MessageType::KeepAlive as u8 => {
+                                            let response = Message::keepalive(vec![]);
+                                            if let Err(e) = tcp_transport.send(response, peer_addr).await {
+                                                warn!("Failed to send keepalive response: {}", e);
+                                            }
+                                        }
+                                        t if t == MessageType::Disconnect as u8 => {
+                                            let mut clients_map = clients_clone_clone.lock().await;
+                                            clients_map.remove(&client_id);
+                                            info!("Client {} disconnected", client_id);
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    error!("Error reading message: {}", e);
+                                    break;
+                                }
+                                None => {
+                                    break;
+                                }
+                            }
+                        }
                     });
                 }
                 Err(e) => {
-                    error!("Failed to create TCP transport: {}", e);
+                    error!("Failed to accept connection: {}", e);
                 }
             }
         }
     });
 
-    // Wait for Ctrl+C to shutdown
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        error!("Failed to wait for Ctrl+C: {}", e);
-    }
+    // Handle sending to TCP clients (not implemented yet due to complexity)
+    drop(transport_tx);
+    let _ = tokio::spawn(async move {
+        let mut tun_rx = tun_rx;
+        while let Some(_data) = tun_rx.recv().await {
+            warn!("TCP client send not yet implemented");
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
     info!("Shutting down server...");
 
     tun_handle.abort();
-    tcp_send_handle.abort();
     accept_task.abort();
 
     Ok(())

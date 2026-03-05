@@ -301,10 +301,10 @@ SASE/
 - 日志系统初始化
 
 #### `common.rs` - 共享模块
-- **数据包类型定义** (`PacketType` 枚举)
-- **数据包结构** (`VpnPacket` 结构体)
 - **配置结构** (`ServerConfig`, `ClientConfig`)
-- **常量定义** (协议魔数、MTU、端口等)
+- **常量定义** (MTU、端口等)
+- **TUN I/O 任务** (`tun_io_task`)
+- **IP 包信息打印** (`print_packet_info`)
 
 #### `sase_server.rs` - 服务器
 - UDP socket 监听和数据处理
