@@ -55,7 +55,7 @@ async fn handle_handshake(
     transport: &mut TcpTransport,
     peer_addr: SocketAddr,
     client_id: u32,
-    clients: Arc<Mutex<HashMap<u32, Client>>>,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
 ) -> Result<bool> {
     if msg.message_type != MessageType::Handshake as u8 {
         warn!("Expected handshake message, got type: {}", msg.message_type);
@@ -299,7 +299,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                                     &mut tcp_transport,
                                     peer_addr,
                                     client_id,
-                                    clients_clone_clone,
+                                    &clients_clone_clone,
                                 ).await;
 
                                 if !handshake_success.unwrap_or(false) {
