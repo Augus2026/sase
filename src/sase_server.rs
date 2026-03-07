@@ -2,7 +2,7 @@ use crate::common::{ServerConfig, print_packet_info, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
 use crate::codec::{Message, MessageType};
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ async fn handle_keepalive(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     msg_data: Vec<u8>,
 ) {
-    info!("Keepalive received from {}", src_addr);
+    debug!("Keepalive received from {}", src_addr);
     // Echo back the timestamp data for latency measurement
     let response = Message::keepalive(msg_data);
     if let Err(e) = transport.send(response, src_addr).await {
