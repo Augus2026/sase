@@ -13,10 +13,7 @@ async fn handshake_async(
     server_addr: std::net::SocketAddr,
 ) -> Result<u32> {
     info!("Connecting to server at {}", server_addr);
-
-    // Handshake message - send empty data, server will assign client_id
     let handshake_message = Message::handshake(vec![]);
-
     let mut retry_delay = Duration::from_secs(1);
     let max_retry_delay = Duration::from_secs(300);
     let mut attempt = 0u32;
@@ -37,7 +34,6 @@ async fn handshake_async(
                     Some(Ok((msg, addr))) => {
                         if addr == server_addr {
                             if msg.message_type == MessageType::Handshake as u8 {
-                                // Parse client_id from response data (4 bytes)
                                 if msg.data.len() >= 4 {
                                     let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                                     info!("Connected! Client ID: {}", client_id);
@@ -77,7 +73,7 @@ async fn transport_io_task<T>(
 where
     T: TransportTrait<Error = std::io::Error>,
 {
-    let mut keepalive_interval = interval(Duration::from_secs(10));
+    let mut keepalive_interval = interval(Duration::from_secs(1));
     info!("Transport I/O task started for client {}", client_id);
 
     loop {
@@ -124,7 +120,6 @@ where
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
-                        // Send raw IP data directly
                         print_packet_info("[transport send]", &data);
                         let message = Message::data(data);
                         if let Err(e) = transport.send(message, server_addr).await {
@@ -139,9 +134,7 @@ where
             }
 
             _ = keepalive_interval.tick() => {
-                // Keepalive with empty data
                 let message = Message::keepalive(vec![]);
-
                 if let Err(e) = transport.send(message, server_addr).await {
                     warn!("Keepalive: Failed to send: {}", e);
                 }

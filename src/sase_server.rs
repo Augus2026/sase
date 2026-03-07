@@ -133,14 +133,12 @@ async fn udp_transport_io_task(
                         match msg.message_type {
                             t if t == MessageType::Handshake as u8 => {
                                 let virtual_ip = Ipv4Addr::new(10, 0, 0, next_client_id as u8);
-                                // Send client_id as 4 bytes in response
                                 let response_data = next_client_id.to_be_bytes().to_vec();
                                 let message = Message::handshake(response_data);
 
                                 if let Err(e) = transport.send(message, src_addr).await {
                                     error!("Failed to send handshake to {}: {}", src_addr, e);
                                 } else {
-                                    // Create a dummy channel for UDP clients (not used)
                                     let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
                                     let client = Client {
                                         addr: src_addr,
@@ -156,7 +154,6 @@ async fn udp_transport_io_task(
                                 }
                             }
                             t if t == MessageType::Data as u8 => {
-                                // Data message contains raw IP packet
                                 handle_data(&msg.data, &transport_tx).await;
                             }
                             t if t == MessageType::KeepAlive as u8 => {
@@ -267,15 +264,9 @@ async fn handle_tcp_client_connection(
     clients: Arc<Mutex<HashMap<u32, Client>>>,
 ) {
     let _peer_addr = tcp_transport.peer_addr();
-
-    // Create a channel for sending data to this specific client
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-
-    // Wrap tcp_transport in Arc<Mutex> to allow shared access
     let tcp_transport_shared = Arc::new(Mutex::new(tcp_transport));
     let tcp_transport_for_send = Arc::clone(&tcp_transport_shared);
-
-    // Wait for client handshake message
     let mut transport_guard = tcp_transport_shared.lock().await;
     let peer_addr = transport_guard.peer_addr();
     let handshake_result = transport_guard.next().await;
@@ -296,7 +287,6 @@ async fn handle_tcp_client_connection(
                 return;
             }
 
-            // Spawn a task to handle sending data to the client
             let peer_addr_for_send = peer_addr;
             tokio::spawn(async move {
                 while let Some(data) = client_rx.recv().await {
@@ -312,15 +302,13 @@ async fn handle_tcp_client_connection(
                 }
             });
 
-            // Handle incoming messages from the client
             loop {
                 let mut transport_guard = tcp_transport_shared.lock().await;
                 match transport_guard.next().await {
                     Some(Ok((msg, _addr))) => {
-                        drop(transport_guard); // Release lock before async operations
+                        drop(transport_guard);
                         match msg.message_type {
                             t if t == MessageType::Data as u8 => {
-                                // Data message contains raw IP packet
                                 print_packet_info("[transport read]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
                                     error!("Failed to send to TUN: {}", e);
