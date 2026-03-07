@@ -73,7 +73,7 @@ async fn transport_io_task<T>(
 where
     T: TransportTrait<Error = std::io::Error>,
 {
-    let mut keepalive_interval = interval(Duration::from_secs(3));
+    let mut keepalive_interval = interval(Duration::from_millis(1));
     info!("Transport I/O task started for client {}", client_id);
 
     loop {
@@ -88,7 +88,6 @@ where
 
                         match msg.message_type {
                             t if t == MessageType::Data as u8 => {
-                                // Data message contains raw IP packet
                                 print_packet_info("[transport recv]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
                                     error!("Transport: Failed to send to TUN: {}", e);
@@ -96,7 +95,6 @@ where
                                 }
                             }
                             t if t == MessageType::KeepAlive as u8 => {
-                                // Calculate latency if the keepalive contains a timestamp
                                 if msg.data.len() >= 8 {
                                     let sent_timestamp = u64::from_be_bytes([
                                         msg.data[0], msg.data[1], msg.data[2], msg.data[3],
