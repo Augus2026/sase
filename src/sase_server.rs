@@ -41,6 +41,21 @@ async fn handle_keepalive(
     }
 }
 
+async fn handle_tun_packet(
+    data: Vec<u8>,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+) {
+    let clients_map = clients.lock().await;
+    if let Some(dest_ip) = get_destination_ip(&data) {
+        let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+        if let Some(client) = target_client {
+            if let Err(e) = client.tx.send(data).await {
+                warn!("Failed to send to client {}: {}", client.addr, e);
+            }
+        }
+    }
+}
+
 async fn handle_disconnect(
     addr: SocketAddr,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
@@ -365,32 +380,25 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await?;
-    info!("TCP server listening on {}", config.bind_addr);
-
-    let clients_clone = Arc::clone(&clients);
-    let transport_tx_for_accept = transport_tx.clone();
     let accept_task = tokio::spawn(async move {
+        let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await?;
+        info!("TCP server listening on {}", config.bind_addr);
+
         let mut next_client_id = 2u32;
         loop {
             match TcpTransport::accept(&listener).await {
                 Ok(tcp_transport) => {
                     let peer_addr = tcp_transport.peer_addr();
-                    info!("New TCP connection from {}", peer_addr);
 
-                    let client_id = next_client_id;
+                    info!("New TCP connection from {}", peer_addr);
                     next_client_id = next_client_id.wrapping_add(1);
 
-                    let transport_tx_clone = transport_tx_for_accept.clone();
-                    let clients_clone_clone = Arc::clone(&clients_clone);
-
-                    // Spawn connection handler
                     tokio::spawn(async move {
                         handle_tcp_client_connection(
                             tcp_transport,
-                            client_id,
-                            transport_tx_clone,
-                            clients_clone_clone,
+                            next_client_id,
+                            transport_tx.clone(),
+                            Arc::clone(&clients),
                         ).await
                     });
                 }
@@ -401,21 +409,10 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         }
     });
 
-    // Handle sending data from TUN to TCP clients
-    drop(transport_tx);
-    let clients_for_tun = Arc::clone(&clients);
+    let clients_clone = Arc::clone(&clients);
     tokio::spawn(async move {
-        let mut tun_rx = tun_rx;
         while let Some(data) = tun_rx.recv().await {
-            let clients_map = clients_for_tun.lock().await;
-            if let Some(dest_ip) = get_destination_ip(&data) {
-                let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
-                if let Some(client) = target_client {
-                    if let Err(e) = client.tx.send(data).await {
-                        warn!("Failed to send to client {}: {}", client.addr, e);
-                    }
-                }
-            }
+            handle_tun_packet(data, &clients_clone).await;
         }
     });
 
