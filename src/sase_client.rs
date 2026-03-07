@@ -78,7 +78,6 @@ where
 
     loop {
         tokio::select! {
-            biased; // 按声明顺序处理，优先处理数据流量
             result = transport.next() => {
                 match result {
                     Some(Ok((msg, src_addr))) => {
@@ -149,8 +148,6 @@ where
             }
 
             _ = keepalive_interval.tick() => {
-                // Send keepalive with current timestamp for latency measurement
-                // KeepAlive 放在最后，确保数据流量优先处理
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()

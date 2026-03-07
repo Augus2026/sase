@@ -35,7 +35,6 @@ async fn handle_keepalive(
     msg_data: Vec<u8>,
 ) {
     debug!("Keepalive received from {}", src_addr);
-    // Echo back the timestamp data for latency measurement
     let response = Message::keepalive(msg_data);
     if let Err(e) = transport.send(response, src_addr).await {
         warn!("Failed to send keepalive response to {}: {}", src_addr, e);
