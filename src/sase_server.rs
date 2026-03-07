@@ -46,15 +46,28 @@ async fn handle_tun_packet(
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
 ) {
     let clients_map = clients.lock().await;
+    debug!("handle_tun_packet: clients count = {}", clients_map.len());
+
     if let Some(dest_ip) = get_destination_ip(&data) {
+        debug!("handle_tun_packet: destination IP = {}", dest_ip);
+
+        for (id, client) in clients_map.iter() {
+            debug!("Client {}: virtual_ip = {}, addr = {}", id, client.virtual_ip, client.addr);
+        }
+
         let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
         if let Some(client) = target_client {
+            debug!("handle_tun_packet: found target client {}", client.addr);
 
             print_packet_info("[transport write]", &data);
             if let Err(e) = client.tx.send(data).await {
                 warn!("Failed to send to client {}: {}", client.addr, e);
             }
+        } else {
+            warn!("handle_tun_packet: no client found with virtual_ip {}", dest_ip);
         }
+    } else {
+        warn!("handle_tun_packet: failed to get destination IP");
     }
 }
 
