@@ -13,6 +13,7 @@ use tun2::{create_as_async, Configuration};
 struct Client {
     addr: SocketAddr,
     virtual_ip: Ipv4Addr,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 async fn handle_data(
@@ -56,6 +57,7 @@ async fn handle_handshake(
     peer_addr: SocketAddr,
     client_id: u32,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
+    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> Result<bool> {
     if msg.message_type != MessageType::Handshake as u8 {
         warn!("Expected handshake message, got type: {}", msg.message_type);
@@ -74,11 +76,12 @@ async fn handle_handshake(
     let client = Client {
         addr: peer_addr,
         virtual_ip,
+        tx: client_tx,
     };
 
     {
         let mut clients_map = clients.lock().await;
-        clients_map.insert(client_id, client.clone());
+        clients_map.insert(client_id, client);
     }
 
     info!("Client {} connected from {}, assigned IP: {}", client_id, peer_addr, virtual_ip);
@@ -137,9 +140,12 @@ async fn udp_transport_io_task(
                                 if let Err(e) = transport.send(message, src_addr).await {
                                     error!("Failed to send handshake to {}: {}", src_addr, e);
                                 } else {
+                                    // Create a dummy channel for UDP clients (not used)
+                                    let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
                                     let client = Client {
                                         addr: src_addr,
                                         virtual_ip,
+                                        tx: dummy_tx,
                                     };
                                     {
                                         let mut clients_map = clients.lock().await;
@@ -254,6 +260,108 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     Ok(())
 }
 
+async fn handle_tcp_client_connection(
+    tcp_transport: TcpTransport,
+    client_id: u32,
+    transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    clients: Arc<Mutex<HashMap<u32, Client>>>,
+) {
+    let _peer_addr = tcp_transport.peer_addr();
+
+    // Create a channel for sending data to this specific client
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+
+    // Wrap tcp_transport in Arc<Mutex> to allow shared access
+    let tcp_transport_shared = Arc::new(Mutex::new(tcp_transport));
+    let tcp_transport_for_send = Arc::clone(&tcp_transport_shared);
+
+    // Wait for client handshake message
+    let mut transport_guard = tcp_transport_shared.lock().await;
+    let peer_addr = transport_guard.peer_addr();
+    let handshake_result = transport_guard.next().await;
+    drop(transport_guard);
+
+    match handshake_result {
+        Some(Ok((msg, _))) => {
+            let handshake_success = handle_handshake(
+                msg,
+                &mut *tcp_transport_shared.lock().await,
+                peer_addr,
+                client_id,
+                &clients,
+                client_tx,
+            ).await;
+
+            if !handshake_success.unwrap_or(false) {
+                return;
+            }
+
+            // Spawn a task to handle sending data to the client
+            let peer_addr_for_send = peer_addr;
+            tokio::spawn(async move {
+                while let Some(data) = client_rx.recv().await {
+                    print_packet_info("[transport write]", &data);
+                    let message = Message::data(data);
+                    let mut transport_guard = tcp_transport_for_send.lock().await;
+                    if let Err(e) = transport_guard.send(message, peer_addr_for_send).await {
+                        warn!("Failed to send to {}: {}", peer_addr_for_send, e);
+                        drop(transport_guard);
+                        break;
+                    }
+                    drop(transport_guard);
+                }
+            });
+
+            // Handle incoming messages from the client
+            loop {
+                let mut transport_guard = tcp_transport_shared.lock().await;
+                match transport_guard.next().await {
+                    Some(Ok((msg, _addr))) => {
+                        drop(transport_guard); // Release lock before async operations
+                        match msg.message_type {
+                            t if t == MessageType::Data as u8 => {
+                                // Data message contains raw IP packet
+                                print_packet_info("[transport read]", &msg.data);
+                                if let Err(e) = transport_tx.send(msg.data).await {
+                                    error!("Failed to send to TUN: {}", e);
+                                    break;
+                                }
+                            }
+                            t if t == MessageType::KeepAlive as u8 => {
+                                let response = Message::keepalive(vec![]);
+                                let mut transport_guard = tcp_transport_shared.lock().await;
+                                if let Err(e) = transport_guard.send(response, peer_addr).await {
+                                    warn!("Failed to send keepalive response: {}", e);
+                                }
+                            }
+                            t if t == MessageType::Disconnect as u8 => {
+                                let mut clients_map = clients.lock().await;
+                                clients_map.remove(&client_id);
+                                info!("Client {} disconnected", client_id);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("Error reading message: {}", e);
+                        break;
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+        Some(Err(e)) => {
+            error!("Error reading handshake: {}", e);
+        }
+        None => {
+            info!("Client disconnected before handshake");
+        }
+    }
+}
+
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -288,69 +396,12 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
                     // Spawn connection handler
                     tokio::spawn(async move {
-                        let mut tcp_transport = tcp_transport;
-                        let peer_addr = tcp_transport.peer_addr();
-
-                        // 等待客户端的handshake消息
-                        match tcp_transport.next().await {
-                            Some(Ok((msg, _))) => {
-                                let handshake_success = handle_handshake(
-                                    msg,
-                                    &mut tcp_transport,
-                                    peer_addr,
-                                    client_id,
-                                    &clients_clone_clone,
-                                ).await;
-
-                                if !handshake_success.unwrap_or(false) {
-                                    return;
-                                }
-
-                                // 处理后续消息
-                                loop {
-                                    match tcp_transport.next().await {
-                                        Some(Ok((msg, _addr))) => {
-                                            match msg.message_type {
-                                                t if t == MessageType::Data as u8 => {
-                                                    // Data message contains raw IP packet
-                                                    print_packet_info("[transport read]", &msg.data);
-                                                    if let Err(e) = transport_tx_clone.send(msg.data).await {
-                                                        error!("Failed to send to TUN: {}", e);
-                                                        break;
-                                                    }
-                                                }
-                                                t if t == MessageType::KeepAlive as u8 => {
-                                                    let response = Message::keepalive(vec![]);
-                                                    if let Err(e) = tcp_transport.send(response, peer_addr).await {
-                                                        warn!("Failed to send keepalive response: {}", e);
-                                                    }
-                                                }
-                                                t if t == MessageType::Disconnect as u8 => {
-                                                    let mut clients_map = clients_clone_clone.lock().await;
-                                                    clients_map.remove(&client_id);
-                                                    info!("Client {} disconnected", client_id);
-                                                    break;
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        Some(Err(e)) => {
-                                            error!("Error reading message: {}", e);
-                                            break;
-                                        }
-                                        None => {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                error!("Error reading handshake: {}", e);
-                            }
-                            None => {
-                                info!("Client disconnected before handshake");
-                            }
-                        }
+                        handle_tcp_client_connection(
+                            tcp_transport,
+                            client_id,
+                            transport_tx_clone,
+                            clients_clone_clone,
+                        ).await
                     });
                 }
                 Err(e) => {
@@ -360,12 +411,21 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         }
     });
 
-    // Handle sending to TCP clients (not implemented yet due to complexity)
+    // Handle sending data from TUN to TCP clients
     drop(transport_tx);
-    let _ = tokio::spawn(async move {
+    let clients_for_tun = Arc::clone(&clients);
+    tokio::spawn(async move {
         let mut tun_rx = tun_rx;
-        while let Some(_data) = tun_rx.recv().await {
-            warn!("TCP client send not yet implemented");
+        while let Some(data) = tun_rx.recv().await {
+            let clients_map = clients_for_tun.lock().await;
+            if let Some(dest_ip) = get_destination_ip(&data) {
+                let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+                if let Some(client) = target_client {
+                    if let Err(e) = client.tx.send(data).await {
+                        warn!("Failed to send to client {}: {}", client.addr, e);
+                    }
+                }
+            }
         }
     });
 
