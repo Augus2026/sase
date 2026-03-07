@@ -381,7 +381,8 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     );
 
     let accept_task = tokio::spawn(async move {
-        let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await?;
+        let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await
+            .expect("Failed to bind to address");
         info!("TCP server listening on {}", config.bind_addr);
 
         let mut next_client_id = 2u32;
