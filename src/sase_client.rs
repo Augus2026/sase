@@ -96,7 +96,21 @@ where
                                 }
                             }
                             t if t == MessageType::KeepAlive as u8 => {
-                                info!("Keepalive received from server");
+                                // Calculate latency if the keepalive contains a timestamp
+                                if msg.data.len() >= 8 {
+                                    let sent_timestamp = u64::from_be_bytes([
+                                        msg.data[0], msg.data[1], msg.data[2], msg.data[3],
+                                        msg.data[4], msg.data[5], msg.data[6], msg.data[7],
+                                    ]);
+                                    let received_timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    let latency_ms = received_timestamp - sent_timestamp;
+                                    info!("Keepalive received from server, latency: {}ms", latency_ms);
+                                } else {
+                                    info!("Keepalive received from server (no latency measurement)");
+                                }
                             }
                             t if t == MessageType::Disconnect as u8 => {
                                 warn!("Server disconnected");
@@ -134,7 +148,13 @@ where
             }
 
             _ = keepalive_interval.tick() => {
-                let message = Message::keepalive(vec![]);
+                // Send keepalive with current timestamp for latency measurement
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let timestamp_bytes = timestamp.to_be_bytes().to_vec();
+                let message = Message::keepalive(timestamp_bytes);
                 if let Err(e) = transport.send(message, server_addr).await {
                     warn!("Keepalive: Failed to send: {}", e);
                 }

@@ -32,9 +32,11 @@ async fn handle_data(
 async fn handle_keepalive(
     src_addr: SocketAddr,
     transport: &mut impl TransportTrait<Error = std::io::Error>,
+    msg_data: Vec<u8>,
 ) {
     info!("Keepalive received from {}", src_addr);
-    let response = Message::keepalive(vec![]);
+    // Echo back the timestamp data for latency measurement
+    let response = Message::keepalive(msg_data);
     if let Err(e) = transport.send(response, src_addr).await {
         warn!("Failed to send keepalive response to {}: {}", src_addr, e);
     }
@@ -157,7 +159,7 @@ async fn udp_transport_io_task(
                                 handle_data(&msg.data, &transport_tx).await;
                             }
                             t if t == MessageType::KeepAlive as u8 => {
-                                handle_keepalive(src_addr, &mut transport).await;
+                                handle_keepalive(src_addr, &mut transport, msg.data).await;
                             }
                             t if t == MessageType::Disconnect as u8 => {
                                 handle_disconnect(src_addr, &clients).await;
@@ -316,7 +318,8 @@ async fn handle_tcp_client_connection(
                                 }
                             }
                             t if t == MessageType::KeepAlive as u8 => {
-                                let response = Message::keepalive(vec![]);
+                                // Echo back the timestamp data for latency measurement
+                                let response = Message::keepalive(msg.data);
                                 let mut transport_guard = tcp_transport_shared.lock().await;
                                 if let Err(e) = transport_guard.send(response, peer_addr).await {
                                     warn!("Failed to send keepalive response: {}", e);
