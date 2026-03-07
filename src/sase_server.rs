@@ -49,6 +49,8 @@ async fn handle_tun_packet(
     if let Some(dest_ip) = get_destination_ip(&data) {
         let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
         if let Some(client) = target_client {
+
+            print_packet_info("[transport write]", &data);
             if let Err(e) = client.tx.send(data).await {
                 warn!("Failed to send to client {}: {}", client.addr, e);
             }
