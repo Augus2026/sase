@@ -407,7 +407,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
             .expect("Failed to bind to address");
         info!("TCP server listening on {}", config.bind_addr);
 
-        let mut next_client_id = 2u32;
+        let mut next_client_id = 1u32;
         loop {
             match TcpTransport::accept(&listener).await {
                 Ok(tcp_transport) => {
