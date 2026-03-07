@@ -368,7 +368,7 @@ async fn handle_tcp_client_connection(
 }
 
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
 
@@ -379,6 +379,13 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
             transport_rx
         )
     );
+
+    let clients_clone = Arc::clone(&clients);
+    tokio::spawn(async move {
+        while let Some(data) = tun_rx.recv().await {
+            handle_tun_packet(data, &clients_clone).await;
+        }
+    });
 
     let accept_task = tokio::spawn(async move {
         let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await
@@ -394,12 +401,15 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                     info!("New TCP connection from {}", peer_addr);
                     next_client_id = next_client_id.wrapping_add(1);
 
+                    let tx = transport_tx.clone();
+                    let clients = Arc::clone(&clients);
+
                     tokio::spawn(async move {
                         handle_tcp_client_connection(
                             tcp_transport,
                             next_client_id,
-                            transport_tx.clone(),
-                            Arc::clone(&clients),
+                            tx,
+                            clients,
                         ).await
                     });
                 }
@@ -407,13 +417,6 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                     error!("Failed to accept connection: {}", e);
                 }
             }
-        }
-    });
-
-    let clients_clone = Arc::clone(&clients);
-    tokio::spawn(async move {
-        while let Some(data) = tun_rx.recv().await {
-            handle_tun_packet(data, &clients_clone).await;
         }
     });
 
