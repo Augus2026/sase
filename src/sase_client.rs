@@ -73,7 +73,7 @@ async fn transport_io_task<T>(
 where
     T: TransportTrait<Error = std::io::Error>,
 {
-    let mut keepalive_interval = interval(Duration::from_millis(1000));
+    let mut keepalive_interval = interval(Duration::from_millis(3000));
     info!("Transport I/O task started for client {}", client_id);
 
     loop {

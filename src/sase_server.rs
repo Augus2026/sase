@@ -82,43 +82,6 @@ async fn handle_disconnect(
     }
 }
 
-async fn handle_handshake(
-    msg: Message,
-    transport: &mut TcpTransport,
-    peer_addr: SocketAddr,
-    client_id: u32,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-) -> Result<bool> {
-    if msg.message_type != MessageType::Handshake as u8 {
-        warn!("Expected handshake message, got type: {}", msg.message_type);
-        return Ok(false);
-    }
-
-    let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
-    let response_data = client_id.to_be_bytes().to_vec();
-    let message = Message::handshake(response_data);
-
-    if let Err(e) = transport.send(message, peer_addr).await {
-        error!("Failed to send handshake response: {}", e);
-        return Ok(false);
-    }
-
-    let client = Client {
-        addr: peer_addr,
-        virtual_ip,
-        tx: client_tx,
-    };
-
-    {
-        let mut clients_map = clients.lock().await;
-        clients_map.insert(client_id, client);
-    }
-
-    info!("Client {} connected from {}, assigned IP: {}", client_id, peer_addr, virtual_ip);
-    Ok(true)
-}
-
 fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
     if data.len() < 20 {
         return None;
@@ -288,98 +251,120 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     Ok(())
 }
 
+async fn handle_tcp_handshake(
+    tcp_transport: &mut TcpTransport,
+    client_id: u32,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+) -> Result<()> {
+    let peer_addr = tcp_transport.peer_addr();
+    info!("Starting TCP handshake with client {} from {}", client_id, peer_addr);
+
+    // Wait for handshake message from client
+    match tcp_transport.next().await {
+        Some(Ok((msg, _addr))) => {
+            if msg.message_type != MessageType::Handshake as u8 {
+                warn!("Expected handshake message, got type: {}", msg.message_type);
+                return Err(anyhow::anyhow!("Invalid handshake message type"));
+            }
+
+            // Assign virtual IP to client
+            let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
+            let response_data = client_id.to_be_bytes().to_vec();
+            let message = Message::handshake(response_data);
+
+            if let Err(e) = tcp_transport.send(message, peer_addr).await {
+                error!("Failed to send handshake response: {}", e);
+                return Err(e.into());
+            }
+
+            // Create client and add to clients map
+            let (client_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+            let client = Client {
+                addr: peer_addr,
+                virtual_ip,
+                tx: client_tx,
+            };
+
+            {
+                let mut clients_map = clients.lock().await;
+                clients_map.insert(client_id, client);
+            }
+
+            info!("TCP handshake completed for client {} from {}, assigned IP: {}",
+                  client_id, peer_addr, virtual_ip);
+            Ok(())
+        }
+        Some(Err(e)) => {
+            error!("Error during handshake with {}: {}", peer_addr, e);
+            Err(e.into())
+        }
+        None => {
+            warn!("Connection closed during handshake with {}", peer_addr);
+            Err(anyhow::anyhow!("Connection closed during handshake"))
+        }
+    }
+}
+
 async fn handle_tcp_client_connection(
-    tcp_transport: TcpTransport,
+    mut tcp_transport: TcpTransport,
     client_id: u32,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     clients: Arc<Mutex<HashMap<u32, Client>>>,
 ) {
-    let _peer_addr = tcp_transport.peer_addr();
-    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let tcp_transport_shared = Arc::new(Mutex::new(tcp_transport));
-    let tcp_transport_for_send = Arc::clone(&tcp_transport_shared);
-    let mut transport_guard = tcp_transport_shared.lock().await;
-    let peer_addr = transport_guard.peer_addr();
-    let handshake_result = transport_guard.next().await;
-    drop(transport_guard);
+    let peer_addr = tcp_transport.peer_addr();
 
-    match handshake_result {
-        Some(Ok((msg, _))) => {
-            let handshake_success = handle_handshake(
-                msg,
-                &mut *tcp_transport_shared.lock().await,
-                peer_addr,
-                client_id,
-                &clients,
-                client_tx,
-            ).await;
+    // Perform handshake first
+    if let Err(e) = handle_tcp_handshake(&mut tcp_transport, client_id, &clients).await {
+        error!("Handshake failed for client {} from {}: {}", client_id, peer_addr, e);
+        return;
+    }
 
-            if !handshake_success.unwrap_or(false) {
-                return;
-            }
+    info!("Handling TCP client connection {} from {}", client_id, peer_addr);
 
-            let peer_addr_for_send = peer_addr;
-            tokio::spawn(async move {
-                while let Some(data) = client_rx.recv().await {
-                    print_packet_info("[transport write]", &data);
-                    let message = Message::data(data);
-                    let mut transport_guard = tcp_transport_for_send.lock().await;
-                    if let Err(e) = transport_guard.send(message, peer_addr_for_send).await {
-                        warn!("Failed to send to {}: {}", peer_addr_for_send, e);
-                        drop(transport_guard);
-                        break;
-                    }
-                    drop(transport_guard);
-                }
-            });
-
-            loop {
-                let mut transport_guard = tcp_transport_shared.lock().await;
-                match transport_guard.next().await {
-                    Some(Ok((msg, _addr))) => {
-                        drop(transport_guard);
-                        match msg.message_type {
-                            t if t == MessageType::Data as u8 => {
-                                print_packet_info("[transport read]", &msg.data);
-                                if let Err(e) = transport_tx.send(msg.data).await {
-                                    error!("Failed to send to TUN: {}", e);
-                                    break;
-                                }
-                            }
-                            t if t == MessageType::KeepAlive as u8 => {
-                                // Echo back the timestamp data for latency measurement
-                                let response = Message::keepalive(msg.data);
-                                let mut transport_guard = tcp_transport_shared.lock().await;
-                                if let Err(e) = transport_guard.send(response, peer_addr).await {
-                                    warn!("Failed to send keepalive response: {}", e);
-                                }
-                            }
-                            t if t == MessageType::Disconnect as u8 => {
-                                let mut clients_map = clients.lock().await;
-                                clients_map.remove(&client_id);
-                                info!("Client {} disconnected", client_id);
-                                break;
-                            }
-                            _ => {}
+    loop {
+        match tcp_transport.next().await {
+            Some(Ok((msg, _addr))) => {
+                match msg.message_type {
+                    t if t == MessageType::Data as u8 => {
+                        print_packet_info("[transport read]", &msg.data);
+                        if let Err(e) = transport_tx.send(msg.data).await {
+                            error!("Failed to send to TUN: {}", e);
+                            break;
                         }
                     }
-                    Some(Err(e)) => {
-                        error!("Error reading message: {}", e);
+                    t if t == MessageType::KeepAlive as u8 => {
+                        debug!("Keepalive received from {}", peer_addr);
+                        let response = Message::keepalive(msg.data);
+                        if let Err(e) = tcp_transport.send(response, peer_addr).await {
+                            warn!("Failed to send keepalive response to {}: {}", peer_addr, e);
+                        }
+                    }
+                    t if t == MessageType::Disconnect as u8 => {
+                        let mut clients_map = clients.lock().await;
+                        clients_map.remove(&client_id);
+                        info!("Client {} disconnected from {}", client_id, peer_addr);
                         break;
                     }
-                    None => {
-                        break;
+                    _ => {
+                        debug!("Unknown message type {} from {}", msg.message_type, peer_addr);
                     }
                 }
             }
-        }
-        Some(Err(e)) => {
-            error!("Error reading handshake: {}", e);
-        }
-        None => {
-            info!("Client disconnected before handshake");
+            Some(Err(e)) => {
+                error!("Error reading message from {}: {}", peer_addr, e);
+                break;
+            }
+            None => {
+                info!("Client {} disconnected", peer_addr);
+                break;
+            }
         }
     }
+
+    // Clean up client on disconnection
+    let mut clients_map = clients.lock().await;
+    clients_map.remove(&client_id);
+    info!("TCP client handler for {} finished", peer_addr);
 }
 
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
