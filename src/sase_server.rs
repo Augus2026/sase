@@ -254,6 +254,7 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 async fn handle_tcp_handshake(
     tcp_transport: &mut TcpTransport,
     client_id: u32,
+    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
 ) -> Result<()> {
     let peer_addr = tcp_transport.peer_addr();
@@ -278,7 +279,6 @@ async fn handle_tcp_handshake(
             }
 
             // Create client and add to clients map
-            let (client_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
             let client = Client {
                 addr: peer_addr,
                 virtual_ip,
@@ -313,8 +313,11 @@ async fn handle_tcp_client_connection(
 ) {
     let peer_addr = tcp_transport.peer_addr();
 
+    // Create a channel for receiving data from TUN to send to this client
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+
     // Perform handshake first
-    if let Err(e) = handle_tcp_handshake(&mut tcp_transport, client_id, &clients).await {
+    if let Err(e) = handle_tcp_handshake(&mut tcp_transport, client_id, client_tx, &clients).await {
         error!("Handshake failed for client {} from {}: {}", client_id, peer_addr, e);
         return;
     }
@@ -322,41 +325,64 @@ async fn handle_tcp_client_connection(
     info!("Handling TCP client connection {} from {}", client_id, peer_addr);
 
     loop {
-        match tcp_transport.next().await {
-            Some(Ok((msg, _addr))) => {
-                match msg.message_type {
-                    t if t == MessageType::Data as u8 => {
-                        print_packet_info("[transport read]", &msg.data);
-                        if let Err(e) = transport_tx.send(msg.data).await {
-                            error!("Failed to send to TUN: {}", e);
-                            break;
+        tokio::select! {
+            // Handle messages from client
+            result = tcp_transport.next() => {
+                match result {
+                    Some(Ok((msg, _addr))) => {
+                        match msg.message_type {
+                            t if t == MessageType::Data as u8 => {
+                                print_packet_info("[transport read]", &msg.data);
+                                if let Err(e) = transport_tx.send(msg.data).await {
+                                    error!("Failed to send to TUN: {}", e);
+                                    break;
+                                }
+                            }
+                            t if t == MessageType::KeepAlive as u8 => {
+                                debug!("Keepalive received from {}", peer_addr);
+                                let response = Message::keepalive(msg.data);
+                                if let Err(e) = tcp_transport.send(response, peer_addr).await {
+                                    warn!("Failed to send keepalive response to {}: {}", peer_addr, e);
+                                }
+                            }
+                            t if t == MessageType::Disconnect as u8 => {
+                                let mut clients_map = clients.lock().await;
+                                clients_map.remove(&client_id);
+                                info!("Client {} disconnected from {}", client_id, peer_addr);
+                                break;
+                            }
+                            _ => {
+                                debug!("Unknown message type {} from {}", msg.message_type, peer_addr);
+                            }
                         }
                     }
-                    t if t == MessageType::KeepAlive as u8 => {
-                        debug!("Keepalive received from {}", peer_addr);
-                        let response = Message::keepalive(msg.data);
-                        if let Err(e) = tcp_transport.send(response, peer_addr).await {
-                            warn!("Failed to send keepalive response to {}: {}", peer_addr, e);
-                        }
-                    }
-                    t if t == MessageType::Disconnect as u8 => {
-                        let mut clients_map = clients.lock().await;
-                        clients_map.remove(&client_id);
-                        info!("Client {} disconnected from {}", client_id, peer_addr);
+                    Some(Err(e)) => {
+                        error!("Error reading message from {}: {}", peer_addr, e);
                         break;
                     }
-                    _ => {
-                        debug!("Unknown message type {} from {}", msg.message_type, peer_addr);
+                    None => {
+                        info!("Client {} disconnected", peer_addr);
+                        break;
                     }
                 }
             }
-            Some(Err(e)) => {
-                error!("Error reading message from {}: {}", peer_addr, e);
-                break;
-            }
-            None => {
-                info!("Client {} disconnected", peer_addr);
-                break;
+
+            // Handle data from TUN to send to client
+            result = client_rx.recv() => {
+                match result {
+                    Some(data) => {
+                        print_packet_info("[transport write]", &data);
+                        let message = Message::data(data);
+                        if let Err(e) = tcp_transport.send(message, peer_addr).await {
+                            warn!("Failed to send data to {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                    None => {
+                        debug!("Client RX channel closed");
+                        break;
+                    }
+                }
             }
         }
     }
