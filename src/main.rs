@@ -76,6 +76,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let log_level = "info";
 
     match cli.command {
         Commands::Server {
@@ -87,7 +88,7 @@ async fn main() -> Result<()> {
             transport,
         } => {
             env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or("debug"),
+                env_logger::Env::default().default_filter_or(log_level),
             )
             .init();
 
@@ -103,7 +104,7 @@ async fn main() -> Result<()> {
             transport,
         } => {
             env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or("debug"),
+                env_logger::Env::default().default_filter_or(log_level),
             )
             .init();
 

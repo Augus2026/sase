@@ -69,9 +69,4 @@ impl Message {
     pub fn disconnect(data: Vec<u8>) -> Self {
         Self::new(MessageType::Disconnect, data)
     }
-
-    /// Get the payload as a UTF-8 string if possible
-    pub fn payload_as_string(&self) -> Option<String> {
-        std::str::from_utf8(&self.data).ok().map(|s| s.to_string())
-    }
 }

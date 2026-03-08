@@ -33,7 +33,7 @@ async fn handshake_async(
                 match result {
                     Some(Ok((msg, addr))) => {
                         if addr == server_addr {
-                            if msg.message_type == MessageType::Handshake as u8 {
+                            if MessageType::try_from(msg.message_type) == Ok(MessageType::Handshake) {
                                 if msg.data.len() >= 4 {
                                     let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                                     info!("Connected! Client ID: {}", client_id);
@@ -86,15 +86,15 @@ where
                             continue;
                         }
 
-                        match msg.message_type {
-                            t if t == MessageType::Data as u8 => {
+                        match MessageType::try_from(msg.message_type) {
+                            Ok(MessageType::Data) => {
                                 print_packet_info("[transport recv]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
                                     error!("Transport: Failed to send to TUN: {}", e);
                                     break;
                                 }
                             }
-                            t if t == MessageType::KeepAlive as u8 => {
+                            Ok(MessageType::KeepAlive) => {
                                 if msg.data.len() >= 8 {
                                     let sent_timestamp = u64::from_be_bytes([
                                         msg.data[0], msg.data[1], msg.data[2], msg.data[3],
@@ -110,11 +110,11 @@ where
                                     info!("Keepalive received from server (no latency measurement)");
                                 }
                             }
-                            t if t == MessageType::Disconnect as u8 => {
+                            Ok(MessageType::Disconnect) => {
                                 warn!("Server disconnected");
                                 break;
                             }
-                            _ => {
+                            Err(_) | Ok(_) => {
                                 info!("Transport: Unknown message type: {}", msg.message_type);
                             }
                         }
@@ -135,7 +135,8 @@ where
                         print_packet_info("[transport send]", &data);
                         let message = Message::data(data);
                         if let Err(e) = transport.send(message, server_addr).await {
-                            warn!("Transport: Failed to send to server: {}", e);
+                            error!("Transport: Failed to send to server: {}", e);
+                            break;
                         }
                     }
                     None => {
@@ -153,11 +154,82 @@ where
                 let timestamp_bytes = timestamp.to_be_bytes().to_vec();
                 let message = Message::keepalive(timestamp_bytes);
                 if let Err(e) = transport.send(message, server_addr).await {
-                    warn!("Keepalive: Failed to send: {}", e);
+                    error!("Keepalive: Failed to send: {}", e);
+                    break;
                 }
             }
         }
     }
+}
+
+pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Result<()> {
+    let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
+    let client_id = handshake_async(&mut transport, config.server_addr).await?;
+
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
+
+    let tun_handle = tokio::spawn(
+        tun_io_task(
+            tun,
+            tun_tx,
+            transport_rx
+        )
+    );
+    let transport_handle = tokio::spawn(
+        transport_io_task(
+            transport,
+            config.server_addr,
+            client_id,
+            tun_rx,
+            transport_tx,
+        )
+    );
+
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down client {}...", client_id);
+
+    tun_handle.abort();
+    transport_handle.abort();
+
+    let _ = tokio::join!(tun_handle, transport_handle);
+
+    return Ok(());
+}
+
+pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Result<()> {
+    let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
+    let client_id = handshake_async(&mut transport, config.server_addr).await?;
+
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
+
+    let tun_handle = tokio::spawn(
+        tun_io_task(
+            tun,
+            tun_tx,
+            transport_rx
+        )
+    );
+    let transport_handle = tokio::spawn(
+        transport_io_task(
+            transport,
+            config.server_addr,
+            client_id,
+            tun_rx,
+            transport_tx,
+        )
+    );
+
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down client {}...", client_id);
+
+    tun_handle.abort();
+    transport_handle.abort();
+
+    let _ = tokio::join!(tun_handle, transport_handle);
+
+    return Ok(());
 }
 
 pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<()> {
@@ -178,71 +250,14 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
     match transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
-            let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
-            let client_id = handshake_async(&mut transport, config.server_addr).await?;
-
-            let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
-            let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
-
-            let tun_handle = tokio::spawn(
-                tun_io_task(
-                    tun,
-                    tun_tx,
-                    transport_rx
-                )
-            );
-            let transport_handle = tokio::spawn(
-                transport_io_task(
-                    transport,
-                    config.server_addr,
-                    client_id,
-                    tun_rx,
-                    transport_tx,
-                )
-            );
-
-            tokio::signal::ctrl_c().await?;
-            info!("Shutting down client {}...", client_id);
-
-            tun_handle.abort();
-            transport_handle.abort();
-
-            return Ok(());
+            run_tcp_client(config, tun).await?;
         }
         "udp" | _ => {
             info!("Using UDP transport");
-            let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
-            let client_id = handshake_async(&mut transport, config.server_addr).await?;
-
-            let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
-            let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
-
-            let tun_handle = tokio::spawn(
-                tun_io_task(
-                    tun,
-                    tun_tx,
-                    transport_rx
-                )
-            );
-            let transport_handle = tokio::spawn(
-                transport_io_task(
-                    transport,
-                    config.server_addr,
-                    client_id,
-                    tun_rx,
-                    transport_tx,
-                )
-            );
-
-            tokio::signal::ctrl_c().await?;
-            info!("Shutting down client {}...", client_id);
-
-            tun_handle.abort();
-            transport_handle.abort();
-
-            return Ok(());
+            run_udp_client(config, tun).await?;
         }
-    };
+    }
+    Ok(())
 }
 
 pub async fn run_client_with_args(
