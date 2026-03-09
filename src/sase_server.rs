@@ -56,6 +56,34 @@ async fn handle_keepalive(
     }
 }
 
+async fn handle_handshake(
+    src_addr: SocketAddr,
+    transport: &mut impl TransportTrait<Error = std::io::Error>,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+    next_client_id: &mut u32,
+) {
+    let virtual_ip = Ipv4Addr::new(10, 0, 0, *next_client_id as u8);
+    let response_data = next_client_id.to_be_bytes().to_vec();
+    let message = Message::handshake(response_data);
+
+    if let Err(e) = transport.send(message, src_addr).await {
+        error!("Failed to send handshake to {}: {}", src_addr, e);
+    } else {
+        let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let client = Client {
+            addr: src_addr,
+            virtual_ip,
+            tx: dummy_tx,
+        };
+        {
+            let mut clients_map = clients.lock().await;
+            clients_map.insert(*next_client_id, client);
+        }
+        info!("Client {} connected from {}, assigned IP: {}", next_client_id, src_addr, virtual_ip);
+        *next_client_id = next_client_id.wrapping_add(1);
+    }
+}
+
 async fn handle_disconnect(
     addr: SocketAddr,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
@@ -111,36 +139,17 @@ async fn udp_transport_io_task(
             result = transport.next() => {
                 match result {
                     Some(Ok((msg, src_addr))) => {
-                        match msg.message_type {
-                            t if t == MessageType::Handshake as u8 => {
-                                let virtual_ip = Ipv4Addr::new(10, 0, 0, next_client_id as u8);
-                                let response_data = next_client_id.to_be_bytes().to_vec();
-                                let message = Message::handshake(response_data);
-
-                                if let Err(e) = transport.send(message, src_addr).await {
-                                    error!("Failed to send handshake to {}: {}", src_addr, e);
-                                } else {
-                                    let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-                                    let client = Client {
-                                        addr: src_addr,
-                                        virtual_ip,
-                                        tx: dummy_tx,
-                                    };
-                                    {
-                                        let mut clients_map = clients.lock().await;
-                                        clients_map.insert(next_client_id, client);
-                                    }
-                                    info!("Client {} connected from {}, assigned IP: {}", next_client_id, src_addr, virtual_ip);
-                                    next_client_id = next_client_id.wrapping_add(1);
-                                }
+                        match MessageType::try_from(msg.message_type) {
+                            Ok(MessageType::Handshake) => {
+                                handle_handshake(src_addr, &mut transport, &clients, &mut next_client_id).await;
                             }
-                            t if t == MessageType::Data as u8 => {
+                            Ok(MessageType::Data) => {
                                 handle_data(&msg.data, &transport_tx).await;
                             }
-                            t if t == MessageType::KeepAlive as u8 => {
+                            Ok(MessageType::KeepAlive) => {
                                 handle_keepalive(src_addr, &mut transport, msg.data).await;
                             }
-                            t if t == MessageType::Disconnect as u8 => {
+                            Ok(MessageType::Disconnect) => {
                                 handle_disconnect(src_addr, &clients).await;
                             }
                             _ => {
@@ -279,22 +288,22 @@ async fn handle_tcp_client_connection(
             result = tcp_transport.next() => {
                 match result {
                     Some(Ok((msg, _addr))) => {
-                        match msg.message_type {
-                            t if t == MessageType::Data as u8 => {
+                        match MessageType::try_from(msg.message_type) {
+                            Ok(MessageType::Data) => {
                                 print_packet_info("[transport read]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
                                     error!("Failed to send to TUN: {}", e);
                                     break;
                                 }
                             }
-                            t if t == MessageType::KeepAlive as u8 => {
+                            Ok(MessageType::KeepAlive) => {
                                 debug!("Keepalive received from {}", peer_addr);
                                 let response = Message::keepalive(msg.data);
                                 if let Err(e) = tcp_transport.send(response, peer_addr).await {
                                     warn!("Failed to send keepalive response to {}: {}", peer_addr, e);
                                 }
                             }
-                            t if t == MessageType::Disconnect as u8 => {
+                            Ok(MessageType::Disconnect) => {
                                 debug!("Disconnect message received from {}", peer_addr);
                                 let mut clients_map = clients.lock().await;
                                 clients_map.remove(&client_id);

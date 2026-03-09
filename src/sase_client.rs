@@ -33,16 +33,17 @@ async fn handshake_async(
                 match result {
                     Some(Ok((msg, addr))) => {
                         if addr == server_addr {
-                            if MessageType::try_from(msg.message_type) == Ok(MessageType::Handshake) {
-                                if msg.data.len() >= 4 {
-                                    let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                                    info!("Connected! Client ID: {}", client_id);
-                                    return Ok(client_id);
-                                } else {
-                                    info!("Invalid handshake response: missing client_id");
+                            match MessageType::try_from(msg.message_type) {
+                                Ok(MessageType::Handshake) => {
+                                    if msg.data.len() >= 4 {
+                                        let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                                        info!("Connected! Client ID: {}", client_id);
+                                        return Ok(client_id);
+                                    }
                                 }
-                            } else {
-                                info!("Unexpected packet type during handshake: {}", msg.message_type);
+                                _ => {
+                                    info!("Invalid handshake response: unexpected message type: {}", msg.message_type);
+                                }
                             }
                         }
                     }
@@ -114,7 +115,7 @@ where
                                 warn!("Server disconnected");
                                 break;
                             }
-                            Err(_) | Ok(_) => {
+                            _ => {
                                 info!("Transport: Unknown message type: {}", msg.message_type);
                             }
                         }
