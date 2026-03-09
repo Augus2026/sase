@@ -245,9 +245,13 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             info!("Using TCP transport");
             run_tcp_client(config, tun).await?;
         }
-        "udp" | _ => {
+        "udp" => {
             info!("Using UDP transport");
             run_udp_client(config, tun).await?;
+        }
+        _ => {
+            error!("Unknown transport type: {}", transport_type);
+            return Err(anyhow::anyhow!("Unknown transport type: {}", transport_type));
         }
     }
     Ok(())
