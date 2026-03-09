@@ -163,12 +163,12 @@ where
 }
 
 pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Result<()> {
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
+
     let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
     let client_id = handshake_async(&mut transport, config.server_addr).await?;
 
-    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
-    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
-
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
@@ -186,23 +186,19 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Res
         )
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down client {}...", client_id);
-
-    tun_handle.abort();
-    transport_handle.abort();
-
-    let _ = tokio::join!(tun_handle, transport_handle);
-
-    return Ok(());
+    tokio::select! {
+        _ = tun_handle => {},
+        _ = transport_handle => {},
+    }
+    Ok(())
 }
 
 pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
-    let client_id = handshake_async(&mut transport, config.server_addr).await?;
-
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
+
+    let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
+    let client_id = handshake_async(&mut transport, config.server_addr).await?;
 
     let tun_handle = tokio::spawn(
         tun_io_task(
@@ -221,15 +217,11 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Res
         )
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down client {}...", client_id);
-
-    tun_handle.abort();
-    transport_handle.abort();
-
-    let _ = tokio::join!(tun_handle, transport_handle);
-
-    return Ok(());
+    tokio::select! {
+        _ = tun_handle => {},
+        _ = transport_handle => {},
+    }
+    Ok(())
 }
 
 pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<()> {

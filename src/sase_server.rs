@@ -16,6 +16,21 @@ struct Client {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
+    if data.len() < 20 {
+        return None;
+    }
+
+    let version_ihl = data[0];
+    let version = version_ihl >> 4;
+    if version != 4 {
+        return None;
+    }
+
+    let dest_ip_bytes: [u8; 4] = data[16..20].try_into().ok()?;
+    Some(Ipv4Addr::from(dest_ip_bytes))
+}
+
 async fn handle_data(
     data: &[u8],
     transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -41,36 +56,6 @@ async fn handle_keepalive(
     }
 }
 
-async fn handle_tun_packet(
-    data: Vec<u8>,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-) {
-    let clients_map = clients.lock().await;
-    debug!("handle_tun_packet: clients count = {}", clients_map.len());
-
-    if let Some(dest_ip) = get_destination_ip(&data) {
-        debug!("handle_tun_packet: destination IP = {}", dest_ip);
-
-        for (id, client) in clients_map.iter() {
-            debug!("Client {}: virtual_ip = {}, addr = {}", id, client.virtual_ip, client.addr);
-        }
-
-        let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
-        if let Some(client) = target_client {
-            debug!("handle_tun_packet: found target client {}", client.addr);
-
-            print_packet_info("[transport write]", &data);
-            if let Err(e) = client.tx.send(data).await {
-                warn!("Failed to send to client {}: {}", client.addr, e);
-            }
-        } else {
-            warn!("handle_tun_packet: no client found with virtual_ip {}", dest_ip);
-        }
-    } else {
-        warn!("handle_tun_packet: failed to get destination IP");
-    }
-}
-
 async fn handle_disconnect(
     addr: SocketAddr,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
@@ -82,19 +67,22 @@ async fn handle_disconnect(
     }
 }
 
-fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
-    if data.len() < 20 {
-        return None;
+async fn handle_tun_packet(
+    data: Vec<u8>,
+    clients: &Arc<Mutex<HashMap<u32, Client>>>,
+) {
+    let clients_map = clients.lock().await;
+    if let Some(dest_ip) = get_destination_ip(&data) {
+        let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+        if let Some(client) = target_client {
+            print_packet_info("[transport write]", &data);
+            if let Err(e) = client.tx.send(data).await {
+                warn!("Failed to send to client {}: {}", client.addr, e);
+            }
+        }
+    } else {
+        warn!("handle_tun_packet: failed to get destination IP");
     }
-
-    let version_ihl = data[0];
-    let version = version_ihl >> 4;
-    if version != 4 {
-        return None;
-    }
-
-    let dest_ip_bytes: [u8; 4] = data[16..20].try_into().ok()?;
-    Some(Ipv4Addr::from(dest_ip_bytes))
 }
 
 async fn send_to_client(
@@ -104,7 +92,6 @@ async fn send_to_client(
 ) {
     print_packet_info("[transport write]", &data);
     let message = Message::data(data.to_vec());
-
     if let Err(e) = transport.send(message, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
     }
@@ -192,39 +179,12 @@ async fn udp_transport_io_task(
     }
 }
 
-pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<()> {
-    let mut tun_config = Configuration::default();
-    tun_config
-        .tun_name(&config.tun_name)
-        .layer(tun2::Layer::L3)
-        .mtu(config.mtu as u16)
-        .address(config.tun_addr)
-        .netmask(config.tun_netmask)
-        .up();
-    let tun = create_as_async(&tun_config)?;
-
-    match transport_type.to_lowercase().as_str() {
-        "tcp" => {
-            info!("Using TCP transport");
-            run_tcp_server(config, tun).await
-        }
-        "udp" => {
-            info!("Using UDP transport");
-            run_udp_server(config, tun).await
-        }
-        _ => {
-            error!("Unknown transport type: {}", transport_type);
-            Err(anyhow::anyhow!("Unknown transport type: {}", transport_type))
-        }
-    }
-}
-
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
-    let transport = UdpTransport::bind(config.bind_addr.to_string().as_str()).await?;
-
     let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
+
+    let transport = UdpTransport::bind(config.bind_addr.to_string().as_str()).await?;
 
     let tun_handle = tokio::spawn(
         tun_io_task(
@@ -242,12 +202,10 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down server...");
-
-    tun_handle.abort();
-    transport_handle.abort();
-
+    tokio::select! {
+        _ = tun_handle => {},
+        _ = transport_handle => {},
+    }
     Ok(())
 }
 
@@ -260,7 +218,6 @@ async fn handle_tcp_handshake(
     let peer_addr = tcp_transport.peer_addr();
     info!("Starting TCP handshake with client {} from {}", client_id, peer_addr);
 
-    // Wait for handshake message from client
     match tcp_transport.next().await {
         Some(Ok((msg, _addr))) => {
             if msg.message_type != MessageType::Handshake as u8 {
@@ -268,7 +225,6 @@ async fn handle_tcp_handshake(
                 return Err(anyhow::anyhow!("Invalid handshake message type"));
             }
 
-            // Assign virtual IP to client
             let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
             let response_data = client_id.to_be_bytes().to_vec();
             let message = Message::handshake(response_data);
@@ -278,7 +234,6 @@ async fn handle_tcp_handshake(
                 return Err(e.into());
             }
 
-            // Create client and add to clients map
             let client = Client {
                 addr: peer_addr,
                 virtual_ip,
@@ -290,8 +245,7 @@ async fn handle_tcp_handshake(
                 clients_map.insert(client_id, client);
             }
 
-            info!("TCP handshake completed for client {} from {}, assigned IP: {}",
-                  client_id, peer_addr, virtual_ip);
+            info!("TCP handshake completed for client {} from {}, assigned IP: {}", client_id, peer_addr, virtual_ip);
             Ok(())
         }
         Some(Err(e)) => {
@@ -312,21 +266,16 @@ async fn handle_tcp_client_connection(
     clients: Arc<Mutex<HashMap<u32, Client>>>,
 ) {
     let peer_addr = tcp_transport.peer_addr();
-
-    // Create a channel for receiving data from TUN to send to this client
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
 
-    // Perform handshake first
     if let Err(e) = handle_tcp_handshake(&mut tcp_transport, client_id, client_tx, &clients).await {
         error!("Handshake failed for client {} from {}: {}", client_id, peer_addr, e);
         return;
     }
-
     info!("Handling TCP client connection {} from {}", client_id, peer_addr);
 
     loop {
         tokio::select! {
-            // Handle messages from client
             result = tcp_transport.next() => {
                 match result {
                     Some(Ok((msg, _addr))) => {
@@ -346,9 +295,9 @@ async fn handle_tcp_client_connection(
                                 }
                             }
                             t if t == MessageType::Disconnect as u8 => {
+                                debug!("Disconnect message received from {}", peer_addr);
                                 let mut clients_map = clients.lock().await;
                                 clients_map.remove(&client_id);
-                                info!("Client {} disconnected from {}", client_id, peer_addr);
                                 break;
                             }
                             _ => {
@@ -367,7 +316,6 @@ async fn handle_tcp_client_connection(
                 }
             }
 
-            // Handle data from TUN to send to client
             result = client_rx.recv() => {
                 match result {
                     Some(data) => {
@@ -387,7 +335,6 @@ async fn handle_tcp_client_connection(
         }
     }
 
-    // Clean up client on disconnection
     let mut clients_map = clients.lock().await;
     clients_map.remove(&client_id);
     info!("TCP client handler for {} finished", peer_addr);
@@ -446,13 +393,38 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         }
     });
 
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down server...");
-
-    tun_handle.abort();
-    accept_task.abort();
-
+    tokio::select! {
+        _ = tun_handle => {},
+        _ = accept_task => {},
+    }
     Ok(())
+}
+
+pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<()> {
+    let mut tun_config = Configuration::default();
+    tun_config
+        .tun_name(&config.tun_name)
+        .layer(tun2::Layer::L3)
+        .mtu(config.mtu as u16)
+        .address(config.tun_addr)
+        .netmask(config.tun_netmask)
+        .up();
+    let tun = create_as_async(&tun_config)?;
+
+    match transport_type.to_lowercase().as_str() {
+        "tcp" => {
+            info!("Using TCP transport");
+            run_tcp_server(config, tun).await
+        }
+        "udp" => {
+            info!("Using UDP transport");
+            run_udp_server(config, tun).await
+        }
+        _ => {
+            error!("Unknown transport type: {}", transport_type);
+            Err(anyhow::anyhow!("Unknown transport type: {}", transport_type))
+        }
+    }
 }
 
 pub async fn run_server_with_args(
