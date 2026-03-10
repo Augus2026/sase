@@ -1,7 +1,7 @@
 use crate::common::{ServerConfig, print_packet_info, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
 use crate::codec::{Message, MessageType};
-use crate::tun_config::{build_tun_config, serialize_tun_config};
+use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -14,6 +14,7 @@ use tun2::{create_as_async, Configuration};
 struct Client {
     addr: SocketAddr,
     virtual_ip: Ipv4Addr,
+    tun_config: TunConfig,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
@@ -57,34 +58,33 @@ async fn handle_handshake(
     src_addr: SocketAddr,
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
-    next_client_id: &mut u32,
+    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    client_id: u32,
 ) {
-    let virtual_ip = Ipv4Addr::new(10, 0, 0, *next_client_id as u8);
-
-    let tun_config = build_tun_config(*next_client_id, &virtual_ip.to_string());
-
-    let mut response_data = next_client_id.to_be_bytes().to_vec();
+    let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
+    let tun_config = build_tun_config(client_id, &virtual_ip.to_string());
+    let mut response_data = client_id.to_be_bytes().to_vec();
     response_data.extend_from_slice(&serialize_tun_config(&tun_config));
-
     let message = Message::handshake(response_data);
 
     if let Err(e) = transport.send(message, src_addr).await {
         error!("Failed to send handshake to {}: {}", src_addr, e);
-    } else {
-        let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let client = Client {
-            addr: src_addr,
-            virtual_ip,
-            tx: dummy_tx,
-        };
-        {
-            let mut clients_map = clients.lock().await;
-            clients_map.insert(*next_client_id, client);
-        }
-        info!("Client {} connected from {}, assigned IP: {}",
-              next_client_id, src_addr, virtual_ip);
-        *next_client_id = next_client_id.wrapping_add(1);
+        return;
     }
+    
+    let client = Client {
+        addr: src_addr,
+        virtual_ip,
+        tun_config,
+        tx: client_tx,
+    };
+
+    {
+        let mut clients_map = clients.lock().await;
+        clients_map.insert(client_id, client);
+    }
+
+    info!("Client {} connected from {}, assigned IP: {}", client_id, src_addr, virtual_ip);
 }
 
 async fn handle_disconnect(
@@ -142,7 +142,10 @@ async fn udp_transport_io_task(
                     Some(Ok((msg, src_addr))) => {
                         match MessageType::try_from(msg.message_type) {
                             Ok(MessageType::Handshake) => {
-                                handle_handshake(src_addr, &mut transport, &clients, &mut next_client_id).await;
+                                let client_id = next_client_id;
+                                next_client_id = next_client_id.wrapping_add(1);
+                                let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id).await;
                             }
                             Ok(MessageType::Data) => {
                                 handle_data(&msg.data, &transport_tx).await;
@@ -233,34 +236,7 @@ async fn handle_tcp_handshake(
                 warn!("Expected handshake message, got type: {}", msg.message_type);
                 return Err(anyhow::anyhow!("Invalid handshake message type"));
             }
-
-            let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
-
-            let tun_config = build_tun_config(client_id, &virtual_ip.to_string());
-
-            let mut response_data = client_id.to_be_bytes().to_vec();
-            response_data.extend_from_slice(&serialize_tun_config(&tun_config));
-
-            let message = Message::handshake(response_data);
-
-            if let Err(e) = tcp_transport.send(message, peer_addr).await {
-                error!("Failed to send handshake response: {}", e);
-                return Err(e.into());
-            }
-
-            let client = Client {
-                addr: peer_addr,
-                virtual_ip,
-                tx: client_tx,
-            };
-
-            {
-                let mut clients_map = clients.lock().await;
-                clients_map.insert(client_id, client);
-            }
-
-            info!("TCP handshake completed for client {} from {}, assigned IP: {}",
-                  client_id, peer_addr, virtual_ip);
+            handle_handshake(peer_addr, tcp_transport, clients, client_tx, client_id).await;
             Ok(())
         }
         Some(Err(e)) => {
