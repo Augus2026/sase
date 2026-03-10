@@ -1,9 +1,9 @@
 use crate::common::{ServerConfig, print_packet_info, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
 use crate::codec::{Message, MessageType};
-use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
+use crate::tun_config::{build_tun_config, serialize_tun_config};
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,7 +14,6 @@ use tun2::{create_as_async, Configuration};
 struct Client {
     addr: SocketAddr,
     virtual_ip: Ipv4Addr,
-    tun_config: TunConfig,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
@@ -51,7 +50,6 @@ async fn handle_keepalive(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     msg_data: Vec<u8>,
 ) {
-    debug!("Keepalive received from {}", src_addr);
     let response = Message::keepalive(msg_data);
     if let Err(e) = transport.send(response, src_addr).await {
         warn!("Failed to send keepalive response to {}: {}", src_addr, e);
@@ -66,15 +64,10 @@ async fn handle_handshake(
 ) {
     let virtual_ip = Ipv4Addr::new(10, 0, 0, *next_client_id as u8);
 
-    // 使用封装的函数创建TunConfig
     let tun_config = build_tun_config(*next_client_id, &virtual_ip.to_string());
 
-    // 序列化TunConfig到handshake响应
     let mut response_data = next_client_id.to_be_bytes().to_vec();
     response_data.extend_from_slice(&serialize_tun_config(&tun_config));
-
-    debug!("Sending handshake response: client_id={}, total_bytes={}", next_client_id, response_data.len());
-    debug!("Response data: {:?}", response_data);
 
     let message = Message::handshake(response_data);
 
@@ -85,15 +78,14 @@ async fn handle_handshake(
         let client = Client {
             addr: src_addr,
             virtual_ip,
-            tun_config: tun_config.clone(),
             tx: dummy_tx,
         };
         {
             let mut clients_map = clients.lock().await;
             clients_map.insert(*next_client_id, client);
         }
-        info!("Client {} connected from {}, assigned IP: {}, TUN: {}",
-              next_client_id, src_addr, virtual_ip, tun_config.name);
+        info!("Client {} connected from {}, assigned IP: {}",
+              next_client_id, src_addr, virtual_ip);
         *next_client_id = next_client_id.wrapping_add(1);
     }
 }
@@ -122,8 +114,6 @@ async fn handle_tun_packet(
                 warn!("Failed to send to client {}: {}", client.addr, e);
             }
         }
-    } else {
-        warn!("handle_tun_packet: failed to get destination IP");
     }
 }
 
@@ -239,7 +229,6 @@ async fn handle_tcp_handshake(
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
 ) -> Result<()> {
     let peer_addr = tcp_transport.peer_addr();
-    info!("Starting TCP handshake with client {} from {}", client_id, peer_addr);
 
     match tcp_transport.next().await {
         Some(Ok((msg, _addr))) => {
@@ -250,31 +239,10 @@ async fn handle_tcp_handshake(
 
             let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
 
-            // 创建TunConfig并序列化为handshake响应数据
-            let tun_config = TunConfig {
-                name: format!("tun{}", client_id),
-                address: virtual_ip.to_string(),
-                netmask: "255.255.255.0".to_string(),
-                dns: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
-                mtu: 1500,
-            };
+            let tun_config = build_tun_config(client_id, &virtual_ip.to_string());
 
-            // 序列化TunConfig到handshake响应
             let mut response_data = client_id.to_be_bytes().to_vec();
-            response_data.extend_from_slice(tun_config.name.as_bytes());
-            response_data.push(0); // null terminator for name
-            response_data.extend_from_slice(tun_config.address.as_bytes());
-            response_data.push(0); // null terminator for address
-            response_data.extend_from_slice(tun_config.netmask.as_bytes());
-            response_data.push(0); // null terminator for netmask
-            for dns in &tun_config.dns {
-                response_data.extend_from_slice(dns.as_bytes());
-                response_data.push(0); // null terminator for each dns
-            }
-            response_data.extend_from_slice(&tun_config.mtu.to_be_bytes());
-
-            debug!("Sending TCP handshake response: client_id={}, total_bytes={}", client_id, response_data.len());
-            debug!("Response data: {:?}", response_data);
+            response_data.extend_from_slice(&serialize_tun_config(&tun_config));
 
             let message = Message::handshake(response_data);
 
@@ -286,7 +254,6 @@ async fn handle_tcp_handshake(
             let client = Client {
                 addr: peer_addr,
                 virtual_ip,
-                tun_config: tun_config.clone(),
                 tx: client_tx,
             };
 
@@ -295,8 +262,8 @@ async fn handle_tcp_handshake(
                 clients_map.insert(client_id, client);
             }
 
-            info!("TCP handshake completed for client {} from {}, assigned IP: {}, TUN: {}",
-                  client_id, peer_addr, virtual_ip, tun_config.name);
+            info!("TCP handshake completed for client {} from {}, assigned IP: {}",
+                  client_id, peer_addr, virtual_ip);
             Ok(())
         }
         Some(Err(e)) => {
@@ -323,7 +290,6 @@ async fn handle_tcp_client_connection(
         error!("Handshake failed for client {} from {}: {}", client_id, peer_addr, e);
         return;
     }
-    info!("Handling TCP client connection {} from {}", client_id, peer_addr);
 
     loop {
         tokio::select! {
@@ -339,21 +305,17 @@ async fn handle_tcp_client_connection(
                                 }
                             }
                             Ok(MessageType::KeepAlive) => {
-                                debug!("Keepalive received from {}", peer_addr);
                                 let response = Message::keepalive(msg.data);
                                 if let Err(e) = tcp_transport.send(response, peer_addr).await {
                                     warn!("Failed to send keepalive response to {}: {}", peer_addr, e);
                                 }
                             }
                             Ok(MessageType::Disconnect) => {
-                                debug!("Disconnect message received from {}", peer_addr);
                                 let mut clients_map = clients.lock().await;
                                 clients_map.remove(&client_id);
                                 break;
                             }
-                            _ => {
-                                debug!("Unknown message type {} from {}", msg.message_type, peer_addr);
-                            }
+                            _ => {}
                         }
                     }
                     Some(Err(e)) => {
@@ -378,7 +340,6 @@ async fn handle_tcp_client_connection(
                         }
                     }
                     None => {
-                        debug!("Client RX channel closed");
                         break;
                     }
                 }
@@ -388,7 +349,6 @@ async fn handle_tcp_client_connection(
 
     let mut clients_map = clients.lock().await;
     clients_map.remove(&client_id);
-    info!("TCP client handler for {} finished", peer_addr);
 }
 
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
@@ -420,9 +380,6 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         loop {
             match TcpTransport::accept(&listener).await {
                 Ok(tcp_transport) => {
-                    let peer_addr = tcp_transport.peer_addr();
-
-                    info!("New TCP connection from {}", peer_addr);
                     next_client_id = next_client_id.wrapping_add(1);
 
                     let tx = transport_tx.clone();

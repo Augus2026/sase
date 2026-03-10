@@ -3,7 +3,7 @@ use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
 use crate::codec::{Message, MessageType};
 use crate::tun_config::{TunConfig, deserialize_tun_config, create_tun_device};
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
@@ -23,7 +23,6 @@ async fn handshake_async(
         info!("Handshake attempt {} to {}", attempt, server_addr);
 
         transport.send(handshake_message.clone(), server_addr).await?;
-        info!("Handshake sent to {}", server_addr);
 
         let timeout = sleep(Duration::from_secs(5));
         tokio::pin!(timeout);
@@ -38,11 +37,6 @@ async fn handshake_async(
                                     if msg.data.len() >= 4 {
                                         let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                                         info!("Connected! Client ID: {}", client_id);
-
-                                        // 解析TunConfig
-                                        debug!("Received handshake data (total {} bytes): {:?}", msg.data.len(), msg.data);
-                                        debug!("Client ID: {}, remaining data for TunConfig: {} bytes", client_id, msg.data.len() - 4);
-                                        debug!("TunConfig data: {:?}", &msg.data[4..]);
 
                                         if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
                                             info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
@@ -122,7 +116,7 @@ where
                                     let latency_ms = received_timestamp - sent_timestamp;
                                     info!("Keepalive received from server, latency: {}ms", latency_ms);
                                 } else {
-                                    info!("Keepalive received from server (no latency measurement)");
+                                    info!("Keepalive received from server");
                                 }
                             }
                             Ok(MessageType::Disconnect) => {

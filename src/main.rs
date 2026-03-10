@@ -9,12 +9,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
 
-/// SASE - Simple And Secure VPN
 #[derive(Parser, Debug)]
 #[command(name = "sase")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Log level: debug, info, warn, error (default: debug)
     #[arg(short, long)]
     log_level: Option<String>,
 
@@ -24,55 +22,41 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the VPN server
     Server {
-        /// Bind address (default: 0.0.0.0:12345)
         #[arg(short, long)]
         bind: Option<String>,
 
-        /// TUN device name (default: tun0)
         #[arg(short = 'u', long)]
         tun: Option<String>,
 
-        /// TUN device address (default: 10.0.0.1)
         #[arg(short = 'a', long)]
         address: Option<String>,
 
-        /// Netmask (default: 255.255.255.0)
         #[arg(short = 'n', long)]
         netmask: Option<String>,
 
-        /// MTU (default: 1500)
         #[arg(short = 'm', long)]
         mtu: Option<usize>,
 
-        /// Transport protocol: tcp or udp (default: udp)
         #[arg(short, long)]
         transport: Option<String>,
     },
-    /// Start the VPN client
     Client {
-        /// Server address (default: 127.0.0.1:9999)
         #[arg(short, long)]
         server: Option<String>,
 
-        /// TUN device name (default: tun0)
         #[arg(short = 'u', long)]
         tun: Option<String>,
 
-        /// TUN device address (default: 10.0.0.2)
         #[arg(short = 'a', long)]
         address: Option<String>,
 
-        /// Netmask (default: 255.255.255.0)
         #[arg(short = 'n', long)]
         netmask: Option<String>,
 
-        /// MTU (default: 1500)
         #[arg(short = 'm', long)]
         mtu: Option<usize>,
 
-        /// Transport protocol: tcp or udp (default: udp)
         #[arg(short, long)]
         transport: Option<String>,
     },

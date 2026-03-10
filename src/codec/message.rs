@@ -1,8 +1,5 @@
-//! Custom message types for TCP communication
-
 use serde::{Deserialize, Serialize};
 
-/// Message type enumeration for type-safe message creation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum MessageType {
@@ -32,17 +29,13 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-/// Custom message structure for TCP communication
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
-    /// Message type/command
     pub message_type: u8,
-    /// Message payload data
     pub data: Vec<u8>,
 }
 
 impl Message {
-    /// Create a new custom message
     pub fn new(message_type: MessageType, data: Vec<u8>) -> Self {
         Self {
             message_type: message_type.into(),
@@ -50,23 +43,15 @@ impl Message {
         }
     }
 
-    /// Create a handshake message
     pub fn handshake(data: Vec<u8>) -> Self {
         Self::new(MessageType::Handshake, data)
     }
 
-    /// Create a data message
     pub fn data(data: Vec<u8>) -> Self {
         Self::new(MessageType::Data, data)
     }
 
-    /// Create a keepalive message
     pub fn keepalive(data: Vec<u8>) -> Self {
         Self::new(MessageType::KeepAlive, data)
-    }
-
-    /// Create a disconnect message
-    pub fn disconnect(data: Vec<u8>) -> Self {
-        Self::new(MessageType::Disconnect, data)
     }
 }

@@ -2,13 +2,11 @@ use log::{debug, info, warn, error};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// VPN protocol configuration
 pub const SERVER_ADDR: &str = "0.0.0.0";
 pub const SERVER_PORT: u16 = 12345;
 pub const TUN_NAME: &str = "tun0";
 pub const TUN_MTU: usize = 1500;
 
-/// Client configuration
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub server_addr: SocketAddr,
@@ -30,7 +28,6 @@ impl Default for ClientConfig {
     }
 }
 
-/// Server configuration
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
@@ -52,7 +49,6 @@ impl Default for ServerConfig {
     }
 }
 
-/// Print IP packet information for debugging
 #[allow(dead_code)]
 pub fn print_packet_info(prefix: &str, data: &[u8]) {
     if data.len() < 20 {
@@ -75,7 +71,6 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
 
     match protocol {
         1 => {
-            // ICMP
             if data.len() >= ihl + 8 {
                 let icmp_type = data[ihl];
                 let icmp_code = data[ihl + 1];
@@ -96,7 +91,6 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
             }
         }
         6 => {
-            // TCP
             if data.len() >= ihl + 20 {
                 let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
                 let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
@@ -118,7 +112,6 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
             }
         }
         17 => {
-            // UDP
             if data.len() >= ihl + 8 {
                 let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
                 let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
@@ -127,7 +120,6 @@ pub fn print_packet_info(prefix: &str, data: &[u8]) {
             }
         }
         _ => {
-            // Unknown protocol - dump first 32 bytes for debugging
             let hex_dump: Vec<String> = data.iter()
                 .take(32)
                 .map(|b| format!("{:02x}", b))
