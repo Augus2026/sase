@@ -97,6 +97,9 @@ async fn handle_handshake(
     }
     response_data.extend_from_slice(&tun_config.mtu.to_be_bytes());
 
+    debug!("Sending handshake response: client_id={}, total_bytes={}", next_client_id, response_data.len());
+    debug!("Response data: {:?}", response_data);
+
     let message = Message::handshake(response_data);
 
     if let Err(e) = transport.send(message, src_addr).await {
@@ -293,6 +296,9 @@ async fn handle_tcp_handshake(
                 response_data.push(0); // null terminator for each dns
             }
             response_data.extend_from_slice(&tun_config.mtu.to_be_bytes());
+
+            debug!("Sending TCP handshake response: client_id={}, total_bytes={}", client_id, response_data.len());
+            debug!("Response data: {:?}", response_data);
 
             let message = Message::handshake(response_data);
 
