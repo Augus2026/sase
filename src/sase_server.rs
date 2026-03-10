@@ -35,13 +35,10 @@ fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
 async fn handle_data(
     data: &[u8],
     transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-) -> bool {
+) {
     print_packet_info("[transport read]", &data);
     if let Err(e) = transport_tx.send(data.to_vec()).await {
-        error!("Failed to send to transport writer: {}", e);
-        true
-    } else {
-        false
+        warn!("Failed to send to transport writer: {}", e);
     }
 }
 
@@ -277,7 +274,7 @@ async fn handle_tcp_handshake(
     }
 }
 
-async fn handle_tcp_client_connection(
+async fn handle_tcp_connection(
     mut tcp_transport: TcpTransport,
     client_id: u32,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -295,27 +292,20 @@ async fn handle_tcp_client_connection(
         tokio::select! {
             result = tcp_transport.next() => {
                 match result {
-                    Some(Ok((msg, _addr))) => {
+                    Some(Ok((msg, src_addr))) => {
                         match MessageType::try_from(msg.message_type) {
                             Ok(MessageType::Data) => {
-                                print_packet_info("[transport read]", &msg.data);
-                                if let Err(e) = transport_tx.send(msg.data).await {
-                                    error!("Failed to send to TUN: {}", e);
-                                    break;
-                                }
+                                handle_data(&msg.data, &transport_tx).await;
                             }
                             Ok(MessageType::KeepAlive) => {
-                                let response = Message::keepalive(msg.data);
-                                if let Err(e) = tcp_transport.send(response, peer_addr).await {
-                                    warn!("Failed to send keepalive response to {}: {}", peer_addr, e);
-                                }
+                                handle_keepalive(src_addr, &mut tcp_transport, msg.data).await;
                             }
                             Ok(MessageType::Disconnect) => {
-                                let mut clients_map = clients.lock().await;
-                                clients_map.remove(&client_id);
-                                break;
+                                handle_disconnect(src_addr, &clients).await;
                             }
-                            _ => {}
+                            _ => {
+                                warn!("Unknown message type: from {}: {}", src_addr, msg.message_type);
+                            }
                         }
                     }
                     Some(Err(e)) => {
@@ -386,7 +376,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                     let clients = Arc::clone(&clients);
 
                     tokio::spawn(async move {
-                        handle_tcp_client_connection(
+                        handle_tcp_connection(
                             tcp_transport,
                             next_client_id,
                             tx,

@@ -54,4 +54,8 @@ impl Message {
     pub fn keepalive(data: Vec<u8>) -> Self {
         Self::new(MessageType::KeepAlive, data)
     }
+
+    pub fn disconnect(data: Vec<u8>) -> Self {
+        Self::new(MessageType::Disconnect, data)
+    }
 }
