@@ -14,6 +14,10 @@ use log::info;
 #[command(name = "sase")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Log level: debug, info, warn, error (default: debug)
+    #[arg(short, long)]
+    log_level: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -77,7 +81,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let log_level = "debug";
+    let log_level = cli.log_level.unwrap_or_else(|| "info".to_string());
 
     match cli.command {
         Commands::Server {
