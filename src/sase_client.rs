@@ -8,10 +8,19 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tun2::{create_as_async, Configuration};
 
+#[derive(Debug, Clone)]
+struct TunConfig {
+    pub name: String,
+    pub address: String,
+    pub netmask: String,
+    pub dns: Vec<String>,
+    pub mtu: u32,
+}
+
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     server_addr: std::net::SocketAddr,
-) -> Result<u32> {
+) -> Result<(u32, TunConfig)> {
     info!("Connecting to server at {}", server_addr);
     let handshake_message = Message::handshake(vec![]);
     let mut retry_delay = Duration::from_secs(1);
@@ -38,7 +47,16 @@ async fn handshake_async(
                                     if msg.data.len() >= 4 {
                                         let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                                         info!("Connected! Client ID: {}", client_id);
-                                        return Ok(client_id);
+
+                                        // 解析TunConfig
+                                        if let Some(tun_config) = parse_tun_config(&msg.data[4..]) {
+                                            info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
+                                                  tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+                                            return Ok((client_id, tun_config));
+                                        } else {
+                                            warn!("Failed to parse TUN config from handshake response");
+                                            return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
+                                        }
                                     }
                                 }
                                 _ => {
@@ -62,6 +80,57 @@ async fn handshake_async(
         sleep(retry_delay).await;
         retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
     }
+}
+
+fn parse_tun_config(data: &[u8]) -> Option<TunConfig> {
+    let mut pos = 0;
+
+    // Parse name (null-terminated string)
+    let name_end = data[pos..].iter().position(|&b| b == 0)?;
+    let name = String::from_utf8(data[pos..pos + name_end].to_vec()).ok()?;
+    pos += name_end + 1;
+
+    // Parse address (null-terminated string)
+    let address_end = data[pos..].iter().position(|&b| b == 0)?;
+    let address = String::from_utf8(data[pos..pos + address_end].to_vec()).ok()?;
+    pos += address_end + 1;
+
+    // Parse netmask (null-terminated string)
+    let netmask_end = data[pos..].iter().position(|&b| b == 0)?;
+    let netmask = String::from_utf8(data[pos..pos + netmask_end].to_vec()).ok()?;
+    pos += netmask_end + 1;
+
+    // Parse DNS entries (multiple null-terminated strings until we reach the mtu)
+    let mut dns = Vec::new();
+    while pos + 4 <= data.len() { // Need at least 4 bytes for mtu
+        let dns_end = data[pos..].iter().position(|&b| b == 0)?;
+        if dns_end == 0 {
+            pos += 1; // Skip consecutive null terminators
+            continue;
+        }
+        if dns_end + pos >= data.len() - 4 {
+            break; // Not enough space for mtu
+        }
+        let dns_str = String::from_utf8(data[pos..pos + dns_end].to_vec()).ok()?;
+        if !dns_str.is_empty() {
+            dns.push(dns_str);
+        }
+        pos += dns_end + 1;
+    }
+
+    // Parse MTU (4 bytes)
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let mtu = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+
+    Some(TunConfig {
+        name,
+        address,
+        netmask,
+        dns,
+        mtu,
+    })
 }
 
 async fn transport_io_task<T>(
@@ -163,12 +232,9 @@ where
     }
 }
 
-pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Result<()> {
+pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: TcpTransport, client_id: u32) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
-
-    let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
-    let client_id = handshake_async(&mut transport, config.server_addr).await?;
 
     let tun_handle = tokio::spawn(
         tun_io_task(
@@ -194,12 +260,9 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Res
     Ok(())
 }
 
-pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Result<()> {
+pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: UdpTransport, client_id: u32) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
-
-    let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
-    let client_id = handshake_async(&mut transport, config.server_addr).await?;
 
     let tun_handle = tokio::spawn(
         tun_io_task(
@@ -226,34 +289,63 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice) -> Res
 }
 
 pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<()> {
-    info!("Creating TUN device: {}", config.tun_name);
-
-    let mut tun_config = Configuration::default();
-    tun_config
-        .tun_name(&config.tun_name)
-        .layer(tun2::Layer::L3)
-        .mtu(config.mtu as u16)
-        .address(config.tun_addr)
-        .netmask(config.tun_netmask)
-        .up();
-
-    let tun = create_as_async(&tun_config)?;
-    info!("TUN device created: {} -> {}", config.tun_name, config.tun_addr);
+    info!("Connecting to server to get TUN configuration...");
 
     match transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
-            run_tcp_client(config, tun).await?;
+            let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
+            let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
+
+            info!("Creating TUN device with server config: {}", tun_config.name);
+
+            let address: std::net::Ipv4Addr = tun_config.address.parse()?;
+            let netmask: std::net::Ipv4Addr = tun_config.netmask.parse()?;
+
+            let mut tun_config_builder = Configuration::default();
+            tun_config_builder
+                .tun_name(&tun_config.name)
+                .layer(tun2::Layer::L3)
+                .mtu(tun_config.mtu as u16)
+                .address(address)
+                .netmask(netmask)
+                .up();
+
+            let tun_device = create_as_async(&tun_config_builder)?;
+            info!("TUN device created: {} -> {}", tun_config.name, tun_config.address);
+
+            run_tcp_client(config, tun_device, transport, client_id).await?;
         }
         "udp" => {
             info!("Using UDP transport");
-            run_udp_client(config, tun).await?;
+            let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
+            let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
+
+            info!("Creating TUN device with server config: {}", tun_config.name);
+
+            let address: std::net::Ipv4Addr = tun_config.address.parse()?;
+            let netmask: std::net::Ipv4Addr = tun_config.netmask.parse()?;
+
+            let mut tun_config_builder = Configuration::default();
+            tun_config_builder
+                .tun_name(&tun_config.name)
+                .layer(tun2::Layer::L3)
+                .mtu(tun_config.mtu as u16)
+                .address(address)
+                .netmask(netmask)
+                .up();
+
+            let tun_device = create_as_async(&tun_config_builder)?;
+            info!("TUN device created: {} -> {}", tun_config.name, tun_config.address);
+
+            run_udp_client(config, tun_device, transport, client_id).await?;
         }
         _ => {
             error!("Unknown transport type: {}", transport_type);
             return Err(anyhow::anyhow!("Unknown transport type: {}", transport_type));
         }
     }
+
     Ok(())
 }
 
