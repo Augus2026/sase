@@ -1,6 +1,7 @@
 use crate::common::{ServerConfig, print_packet_info, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
 use crate::codec::{Message, MessageType};
+use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::{collections::HashMap, net::Ipv4Addr};
@@ -8,15 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
-
-#[derive(Clone)]
-struct TunConfig {
-    pub name: String,
-    pub address: String,
-    pub netmask: String,
-    pub dns: Vec<String>,
-    pub mtu: u32,
-}
 
 #[derive(Clone)]
 struct Client {
@@ -74,28 +66,12 @@ async fn handle_handshake(
 ) {
     let virtual_ip = Ipv4Addr::new(10, 0, 0, *next_client_id as u8);
 
-    // 创建TunConfig并序列化为handshake响应数据
-    let tun_config = TunConfig {
-        name: format!("tun{}", *next_client_id),
-        address: virtual_ip.to_string(),
-        netmask: "255.255.255.0".to_string(),
-        dns: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
-        mtu: 1500,
-    };
+    // 使用封装的函数创建TunConfig
+    let tun_config = build_tun_config(*next_client_id, &virtual_ip.to_string());
 
     // 序列化TunConfig到handshake响应
     let mut response_data = next_client_id.to_be_bytes().to_vec();
-    response_data.extend_from_slice(tun_config.name.as_bytes());
-    response_data.push(0); // null terminator for name
-    response_data.extend_from_slice(tun_config.address.as_bytes());
-    response_data.push(0); // null terminator for address
-    response_data.extend_from_slice(tun_config.netmask.as_bytes());
-    response_data.push(0); // null terminator for netmask
-    for dns in &tun_config.dns {
-        response_data.extend_from_slice(dns.as_bytes());
-        response_data.push(0); // null terminator for each dns
-    }
-    response_data.extend_from_slice(&tun_config.mtu.to_be_bytes());
+    response_data.extend_from_slice(&serialize_tun_config(&tun_config));
 
     debug!("Sending handshake response: client_id={}, total_bytes={}", next_client_id, response_data.len());
     debug!("Response data: {:?}", response_data);

@@ -3,6 +3,7 @@ mod codec;
 mod transport;
 mod sase_client;
 mod sase_server;
+mod tun_config;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -76,7 +77,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let log_level = "info";
+    let log_level = "debug";
 
     match cli.command {
         Commands::Server {

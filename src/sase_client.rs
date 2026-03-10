@@ -1,21 +1,12 @@
 use crate::common::{ClientConfig, tun_io_task, print_packet_info};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
 use crate::codec::{Message, MessageType};
+use crate::tun_config::{TunConfig, deserialize_tun_config, create_tun_device};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
-use tun2::{create_as_async, Configuration};
-
-#[derive(Debug, Clone)]
-struct TunConfig {
-    pub name: String,
-    pub address: String,
-    pub netmask: String,
-    pub dns: Vec<String>,
-    pub mtu: u32,
-}
 
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
@@ -53,7 +44,7 @@ async fn handshake_async(
                                         debug!("Client ID: {}, remaining data for TunConfig: {} bytes", client_id, msg.data.len() - 4);
                                         debug!("TunConfig data: {:?}", &msg.data[4..]);
 
-                                        if let Some(tun_config) = parse_tun_config(&msg.data[4..]) {
+                                        if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
                                             info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
                                                   tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
                                             return Ok((client_id, tun_config));
@@ -85,83 +76,6 @@ async fn handshake_async(
         sleep(retry_delay).await;
         retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
     }
-}
-
-fn parse_tun_config(data: &[u8]) -> Option<TunConfig> {
-    let mut pos = 0;
-
-    debug!("parse_tun_config: Starting with {} bytes", data.len());
-    debug!("parse_tun_config: Raw data: {:?}", data);
-
-    // Parse name (null-terminated string)
-    let name_end = data[pos..].iter().position(|&b| b == 0)?;
-    let name = String::from_utf8(data[pos..pos + name_end].to_vec()).ok()?;
-    debug!("parse_tun_config: name='{}', pos={}", name, pos);
-    pos += name_end + 1;
-
-    // Parse address (null-terminated string)
-    if pos >= data.len() {
-        warn!("parse_tun_config: Reached end of data while parsing address");
-        return None;
-    }
-    let address_end = data[pos..].iter().position(|&b| b == 0)?;
-    let address = String::from_utf8(data[pos..pos + address_end].to_vec()).ok()?;
-    debug!("parse_tun_config: address='{}', pos={}", address, pos);
-    pos += address_end + 1;
-
-    // Parse netmask (null-terminated string)
-    if pos >= data.len() {
-        warn!("parse_tun_config: Reached end of data while parsing netmask");
-        return None;
-    }
-    let netmask_end = data[pos..].iter().position(|&b| b == 0)?;
-    let netmask = String::from_utf8(data[pos..pos + netmask_end].to_vec()).ok()?;
-    debug!("parse_tun_config: netmask='{}', pos={}", netmask, pos);
-    pos += netmask_end + 1;
-
-    // Parse DNS entries (multiple null-terminated strings until we reach the mtu)
-    let mut dns = Vec::new();
-    debug!("parse_tun_config: Starting DNS parsing at pos={}", pos);
-
-    while pos + 4 < data.len() { // Need at least 4 bytes for mtu after DNS
-        if pos >= data.len() {
-            break;
-        }
-
-        let dns_end = data[pos..].iter().position(|&b| b == 0)?;
-        if dns_end == 0 {
-            pos += 1; // Skip consecutive null terminators
-            continue;
-        }
-        if pos + dns_end + 1 > data.len() - 4 {
-            debug!("parse_tun_config: Not enough space for DNS + null terminator + mtu");
-            break;
-        }
-        let dns_str = String::from_utf8(data[pos..pos + dns_end].to_vec()).ok()?;
-        if !dns_str.is_empty() {
-            debug!("parse_tun_config: DNS entry='{}', pos={}", dns_str, pos);
-            dns.push(dns_str);
-        }
-        pos += dns_end + 1;
-    }
-
-    debug!("parse_tun_config: DNS parsing complete at pos={}", pos);
-
-    // Parse MTU (4 bytes)
-    if pos + 4 > data.len() {
-        warn!("parse_tun_config: Not enough data for MTU at pos={}, data.len()={}", pos, data.len());
-        return None;
-    }
-    let mtu = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    debug!("parse_tun_config: mtu={}", mtu);
-
-    Some(TunConfig {
-        name,
-        address,
-        netmask,
-        dns,
-        mtu,
-    })
 }
 
 async fn transport_io_task<T>(
@@ -330,20 +244,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
 
             info!("Creating TUN device with server config: {}", tun_config.name);
 
-            let address: std::net::Ipv4Addr = tun_config.address.parse()?;
-            let netmask: std::net::Ipv4Addr = tun_config.netmask.parse()?;
-
-            let mut tun_config_builder = Configuration::default();
-            tun_config_builder
-                .tun_name(&tun_config.name)
-                .layer(tun2::Layer::L3)
-                .mtu(tun_config.mtu as u16)
-                .address(address)
-                .netmask(netmask)
-                .up();
-
-            let tun_device = create_as_async(&tun_config_builder)?;
-            info!("TUN device created: {} -> {}", tun_config.name, tun_config.address);
+            let tun_device = create_tun_device(&tun_config)?;
 
             run_tcp_client(config, tun_device, transport, client_id).await?;
         }
@@ -354,20 +255,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
 
             info!("Creating TUN device with server config: {}", tun_config.name);
 
-            let address: std::net::Ipv4Addr = tun_config.address.parse()?;
-            let netmask: std::net::Ipv4Addr = tun_config.netmask.parse()?;
-
-            let mut tun_config_builder = Configuration::default();
-            tun_config_builder
-                .tun_name(&tun_config.name)
-                .layer(tun2::Layer::L3)
-                .mtu(tun_config.mtu as u16)
-                .address(address)
-                .netmask(netmask)
-                .up();
-
-            let tun_device = create_as_async(&tun_config_builder)?;
-            info!("TUN device created: {} -> {}", tun_config.name, tun_config.address);
+            let tun_device = create_tun_device(&tun_config)?;
 
             run_udp_client(config, tun_device, transport, client_id).await?;
         }
