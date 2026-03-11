@@ -43,8 +43,6 @@ async fn handshake_async(
                                                   tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
                                             return Ok((client_id, tun_config));
                                         } else {
-                                            warn!("Failed to parse TUN config from handshake response");
-                                            warn!("Raw data: {:?}", &msg.data);
                                             return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
                                         }
                                     }
@@ -264,10 +262,6 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
 
 pub async fn run_client_with_args(
     server: Option<String>,
-    tun: Option<String>,
-    address: Option<String>,
-    netmask: Option<String>,
-    mtu: Option<usize>,
     transport: Option<String>,
 ) -> Result<()> {
     let mut config = ClientConfig::default();
@@ -275,22 +269,6 @@ pub async fn run_client_with_args(
 
     if let Some(server) = server {
         config.server_addr = server.parse()?;
-    }
-
-    if let Some(tun) = tun {
-        config.tun_name = tun;
-    }
-
-    if let Some(address) = address {
-        config.tun_addr = address.parse()?;
-    }
-
-    if let Some(netmask) = netmask {
-        config.tun_netmask = netmask.parse()?;
-    }
-
-    if let Some(mtu) = mtu {
-        config.mtu = mtu;
     }
 
     info!("Client configuration: {:?}", config);

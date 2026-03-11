@@ -239,7 +239,6 @@ async fn handle_tcp_connection(
                     Some(Ok((msg, src_addr))) => {
                         match MessageType::try_from(msg.message_type) {
                             Ok(MessageType::Handshake) => {
-                                warn!("Handshake message received again from {}: {:?}", src_addr, msg);
                                 handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id).await;
                             }
                             Ok(MessageType::Data) => {

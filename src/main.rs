@@ -45,18 +45,6 @@ enum Commands {
         #[arg(short, long)]
         server: Option<String>,
 
-        #[arg(short = 'u', long)]
-        tun: Option<String>,
-
-        #[arg(short = 'a', long)]
-        address: Option<String>,
-
-        #[arg(short = 'n', long)]
-        netmask: Option<String>,
-
-        #[arg(short = 'm', long)]
-        mtu: Option<usize>,
-
         #[arg(short, long)]
         transport: Option<String>,
     },
@@ -86,10 +74,6 @@ async fn main() -> Result<()> {
         }
         Commands::Client {
             server,
-            tun,
-            address,
-            netmask,
-            mtu,
             transport,
         } => {
             env_logger::Builder::from_env(
@@ -98,7 +82,7 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Client");
-            sase_client::run_client_with_args(server, tun, address, netmask, mtu, transport).await
+            sase_client::run_client_with_args(server, transport).await
         }
     }
 }

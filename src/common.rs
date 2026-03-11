@@ -2,7 +2,7 @@ use log::{debug, info, warn, error};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const SERVER_ADDR: &str = "0.0.0.0";
+pub const SERVER_ADDR: &str = "127.0.0.1";
 pub const SERVER_PORT: u16 = 12345;
 pub const TUN_NAME: &str = "tun0";
 pub const TUN_MTU: usize = 1500;
@@ -10,20 +10,12 @@ pub const TUN_MTU: usize = 1500;
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub server_addr: SocketAddr,
-    pub tun_name: String,
-    pub tun_addr: Ipv4Addr,
-    pub tun_netmask: Ipv4Addr,
-    pub mtu: usize,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            server_addr: "127.0.0.1:9999".parse().unwrap(),
-            tun_name: "tun0".to_string(),
-            tun_addr: Ipv4Addr::new(10, 0, 0, 2),
-            tun_netmask: Ipv4Addr::new(255, 255, 255, 0),
-            mtu: TUN_MTU,
+            server_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT).parse().unwrap(),
         }
     }
 }
