@@ -102,16 +102,18 @@ async fn handle_disconnect(
 }
 
 async fn handle_tun_packet(
-    data: Vec<u8>,
+    tun_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
 ) {
-    let clients_map = clients.lock().await;
-    if let Some(dest_ip) = get_destination_ip(&data) {
-        let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
-        if let Some(client) = target_client {
-            print_packet_info("[transport write]", &data);
-            if let Err(e) = client.tx.send(data).await {
-                warn!("Failed to send to client {}: {}", client.addr, e);
+    while let Some(data) = tun_rx.recv().await {
+        let clients_map = clients.lock().await;
+        if let Some(dest_ip) = get_destination_ip(&data) {
+            let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+            if let Some(client) = target_client {
+                print_packet_info("[transport write]", &data);
+                if let Err(e) = client.tx.send(data).await {
+                    warn!("Failed to send to client {}: {}", client.addr, e);
+                }
             }
         }
     }
@@ -303,9 +305,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
     let clients_clone = Arc::clone(&clients);
     tokio::spawn(async move {
-        while let Some(data) = tun_rx.recv().await {
-            handle_tun_packet(data, &clients_clone).await;
-        }
+        handle_tun_packet(&mut tun_rx, &clients_clone).await;
     });
 
     let accept_task = tokio::spawn(async move {
