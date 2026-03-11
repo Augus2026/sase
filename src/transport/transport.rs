@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::net::UdpSocket;
 use tokio_util::codec::Framed;
 use tokio_util::udp::UdpFramed;
+use socket2::Socket;
 
 #[allow(async_fn_in_trait)]
 pub trait TransportTrait {
@@ -23,6 +24,14 @@ pub struct TcpTransport {
 impl TcpTransport {
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         let peer_addr = stream.peer_addr()?;
+
+        // Set 8MB buffer sizes using socket2
+        const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB
+        let socket = Socket::from(stream.into_std()?);
+        socket.set_send_buffer_size(BUFFER_SIZE)?;
+        socket.set_recv_buffer_size(BUFFER_SIZE)?;
+        let stream = TcpStream::from_std(socket.into())?;
+
         Ok(Self {
             framed: Framed::new(stream, ByteCodec::new()),
             peer_addr,
@@ -67,6 +76,15 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub fn new(socket: UdpSocket) -> Self {
+        // Set 8MB buffer sizes using socket2
+        const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB
+        let std_socket = socket.into_std().expect("Failed to convert to std socket");
+        let socket2_socket = Socket::from(std_socket);
+        let _ = socket2_socket.set_send_buffer_size(BUFFER_SIZE);
+        let _ = socket2_socket.set_recv_buffer_size(BUFFER_SIZE);
+        let std_socket = socket2_socket.into();
+        let socket = UdpSocket::from_std(std_socket).expect("Failed to convert back to UdpSocket");
+
         Self {
             framed: UdpFramed::new(socket, ByteCodec::new()),
         }
