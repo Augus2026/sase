@@ -4,6 +4,7 @@ use crate::codec::{Message, MessageType};
 use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
 use anyhow::Result;
 use log::{error, info, warn};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,6 +18,8 @@ struct Client {
     tun_config: TunConfig,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
+
+static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 
 fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
     if data.len() < 20 {
@@ -132,7 +135,6 @@ async fn udp_transport_io_task(
     mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    let mut next_client_id = 2u32;
     info!("UDP transport I/O task started");
 
     loop {
@@ -142,8 +144,7 @@ async fn udp_transport_io_task(
                     Some(Ok((msg, src_addr))) => {
                         match MessageType::try_from(msg.message_type) {
                             Ok(MessageType::Handshake) => {
-                                let client_id = next_client_id;
-                                next_client_id = next_client_id.wrapping_add(1);
+                                let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
                                 let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
                                 handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id).await;
                             }
@@ -222,34 +223,6 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     Ok(())
 }
 
-async fn handle_tcp_handshake(
-    tcp_transport: &mut TcpTransport,
-    client_id: u32,
-    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-) -> Result<()> {
-    let peer_addr = tcp_transport.peer_addr();
-
-    match tcp_transport.next().await {
-        Some(Ok((msg, _addr))) => {
-            if msg.message_type != MessageType::Handshake as u8 {
-                warn!("Expected handshake message, got type: {}", msg.message_type);
-                return Err(anyhow::anyhow!("Invalid handshake message type"));
-            }
-            handle_handshake(peer_addr, tcp_transport, clients, client_tx, client_id).await;
-            Ok(())
-        }
-        Some(Err(e)) => {
-            error!("Error during handshake with {}: {}", peer_addr, e);
-            Err(e.into())
-        }
-        None => {
-            warn!("Connection closed during handshake with {}", peer_addr);
-            Err(anyhow::anyhow!("Connection closed during handshake"))
-        }
-    }
-}
-
 async fn handle_tcp_connection(
     mut tcp_transport: TcpTransport,
     client_id: u32,
@@ -259,17 +232,16 @@ async fn handle_tcp_connection(
     let peer_addr = tcp_transport.peer_addr();
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
 
-    if let Err(e) = handle_tcp_handshake(&mut tcp_transport, client_id, client_tx, &clients).await {
-        error!("Handshake failed for client {} from {}: {}", client_id, peer_addr, e);
-        return;
-    }
-
     loop {
         tokio::select! {
             result = tcp_transport.next() => {
                 match result {
                     Some(Ok((msg, src_addr))) => {
                         match MessageType::try_from(msg.message_type) {
+                            Ok(MessageType::Handshake) => {
+                                warn!("Handshake message received again from {}: {:?}", src_addr, msg);
+                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id).await;
+                            }
                             Ok(MessageType::Data) => {
                                 handle_data(&msg.data, &transport_tx).await;
                             }
@@ -342,11 +314,10 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
             .expect("Failed to bind to address");
         info!("TCP server listening on {}", config.bind_addr);
 
-        let mut next_client_id = 1u32;
         loop {
             match TcpTransport::accept(&listener).await {
                 Ok(tcp_transport) => {
-                    next_client_id = next_client_id.wrapping_add(1);
+                    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
 
                     let tx = transport_tx.clone();
                     let clients = Arc::clone(&clients);
@@ -354,7 +325,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
                     tokio::spawn(async move {
                         handle_tcp_connection(
                             tcp_transport,
-                            next_client_id,
+                            client_id,
                             tx,
                             clients,
                         ).await

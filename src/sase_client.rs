@@ -233,22 +233,22 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
     match transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
+
             let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
             let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
-
             let tun_device = create_tun_device(&tun_config)?;
 
             run_tcp_client(config, tun_device, transport, client_id).await?;
         }
         "udp" => {
             info!("Using UDP transport");
+            
             let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
             let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
-
             let tun_device = create_tun_device(&tun_config)?;
 
             run_udp_client(config, tun_device, transport, client_id).await?;
