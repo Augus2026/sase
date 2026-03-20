@@ -1,4 +1,0 @@
-cargo run --release -- client --transport udp --server 192.168.147.146:12345
-cargo run --release -- server --transport tcp --bind 0.0.0.0:12345 --tun tun1 --address 10.0.0.1
-
-route add 110.242.74.102 mask 255.255.255.255 10.0.0.1
