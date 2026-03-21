@@ -9,9 +9,10 @@ use tokio::net::UdpSocket;
 use tokio_util::codec::Framed;
 use tokio_util::udp::UdpFramed;
 use socket2::Socket;
-use tokio_tungstenite::{accept_async_with_config, connect_async, WebSocketStream, MaybeTlsStream};
+use tokio_tungstenite::{accept_async_with_config, connect_async_with_config, WebSocketStream, MaybeTlsStream};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_native_tls::TlsAcceptor;
+use tokio_native_tls::TlsConnector;
 use native_tls::Identity;
 use bincode;
 
@@ -288,24 +289,64 @@ impl WsTransport {
     pub async fn connect(url: &str) -> io::Result<Self> {
         log::info!("Connecting to WebSocket server at {}", url);
 
-        let (ws_stream, _response) = match connect_async(url).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                log::error!("Failed to connect to WebSocket server {}: {}", url, e);
-                return Err(io::Error::new(io::ErrorKind::ConnectionRefused, e));
-            }
-        };
-        log::info!("Connected to WebSocket server");
+        // Parse URL and create custom connection with TLS bypass
+        let parsed_url = url::Url::parse(url)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse URL: {}", e)))?;
 
-        // Extract peer address from URL
-        let server_addr = url::Url::parse(url)
-            .ok()
-            .and_then(|parsed_url: url::Url| {
-                let host = parsed_url.host_str().unwrap_or("localhost");
-                let port = parsed_url.port_or_known_default().unwrap_or(80);
-                format!("{}:{}", host, port).parse().ok()
-            })
-            .unwrap_or_else(|| "127.0.0.1:80".parse().unwrap());
+        let host = parsed_url.host_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing host in URL"))?;
+
+        let port = parsed_url.port_or_known_default()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing port in URL"))?;
+
+        let use_tls = parsed_url.scheme() == "wss";
+
+        // Connect TCP stream
+        let tcp_stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))?;
+
+        // Wrap with TLS if needed, bypassing certificate verification
+        let stream = if use_tls {
+            log::info!("Establishing TLS connection to {} (bypassing certificate verification)", host);
+
+            let mut builder = native_tls::TlsConnector::builder();
+            builder.danger_accept_invalid_certs(true);
+            builder.danger_accept_invalid_hostnames(true);
+
+            let tls_connector = builder.build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build TLS connector: {}", e)))?;
+
+            let tokio_tls_connector = TlsConnector::from(tls_connector);
+            let tls_stream = tokio_tls_connector.connect(host, tcp_stream)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {}", e)))?;
+
+            MaybeTlsStream::NativeTls(tls_stream)
+        } else {
+            MaybeTlsStream::Plain(tcp_stream)
+        };
+
+        // Create WebSocket stream using client handshake
+        let request = tokio_tungstenite::tungstenite::handshake::client::Request::from(tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to create request: {}", e)))?);
+
+        let ws_stream = tokio_tungstenite::client_async_with_config(
+            request,
+            stream,
+            None
+        ).await
+        .map(|(ws, _response)| ws)
+        .map_err(|e| {
+            log::error!("WebSocket handshake failed: {}", e);
+            io::Error::new(io::ErrorKind::ConnectionRefused, format!("WebSocket handshake failed: {}", e))
+        })?;
+
+        // Extract peer address
+        let server_addr = format!("{}:{}", host, port).parse()
+            .unwrap_or_else(|_| "127.0.0.1:80".parse().unwrap());
+
+        log::info!("Connected to WebSocket server at {}", url);
 
         Ok(Self { ws_stream, peer_addr: server_addr })
     }
