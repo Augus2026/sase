@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 tun2 = { version = "4.0", features = ["async"] }
 tokio = { version = "1.40", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 etherparse = "0.19.0"
 log = "0.4"
 env_logger = "0.11"
