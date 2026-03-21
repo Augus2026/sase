@@ -120,8 +120,8 @@ pub struct WsTransport {
 
 impl WsTransport {
     // Default paths for TLS certificates
-    const DEFAULT_CERT_PATH: &'static str = "certs/server-cert.crt";
-    const DEFAULT_KEY_PATH: &'static str = "certs/server-key.key";
+    const DEFAULT_CERT_PATH: &'static str = "certs/server-cert.pem";
+    const DEFAULT_KEY_PATH: &'static str = "certs/server-key.pem";
     const DEFAULT_PKCS12_PATH: &'static str = "certs/server.p12";
 
     /// Create a TLS acceptor from certificate and key files
