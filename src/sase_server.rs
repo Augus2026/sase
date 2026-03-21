@@ -430,10 +430,19 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
     let accept_task = tokio::spawn(async move {
         let listener = WsTransport::bind(config.bind_addr.to_string().as_str()).await
             .expect("Failed to bind to address");
-        info!("WebSocket server listening on {}", config.bind_addr);
+
+        // Try to create TLS acceptor from default certificate paths
+        let tls_acceptor = WsTransport::try_create_default_tls_acceptor()
+            .expect("Failed to create TLS acceptor");
+
+        if tls_acceptor.is_some() {
+            info!("WSS (WebSocket Secure) server listening on {}", config.bind_addr);
+        } else {
+            info!("WebSocket server listening on {}", config.bind_addr);
+        }
 
         loop {
-            match WsTransport::accept(&listener).await {
+            match WsTransport::accept(&listener, tls_acceptor.clone()).await {
                 Ok(ws_transport) => {
                     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
 
