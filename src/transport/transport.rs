@@ -7,7 +7,9 @@ use tokio::net::UdpSocket;
 use tokio_util::codec::Framed;
 use tokio_util::udp::UdpFramed;
 use socket2::Socket;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{accept_async, connect_async, WebSocketStream, MaybeTlsStream};
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use bincode;
 
 #[allow(async_fn_in_trait)]
 pub trait TransportTrait {
@@ -110,18 +112,26 @@ impl TransportTrait for UdpTransport {
 }
 
 /// WebSocket transport - handles WebSocket connections
-pub struct WsTransport {
-    framed: Framed<TcpStream, ByteCodec>,
-    peer_addr: SocketAddr,
+pub enum WsTransport {
+    Client {
+        ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        peer_addr: SocketAddr,
+    },
+    Server {
+        ws_stream: WebSocketStream<TcpStream>,
+        peer_addr: SocketAddr,
+    },
 }
 
 impl WsTransport {
-    pub fn new(stream: TcpStream) -> io::Result<Self> {
+    pub async fn new(stream: TcpStream) -> io::Result<Self> {
         let peer_addr = stream.peer_addr()?;
-        Ok(Self {
-            framed: Framed::new(stream, ByteCodec::new()),
-            peer_addr,
-        })
+        let ws_stream = WebSocketStream::from_raw_socket(
+            MaybeTlsStream::Plain(stream),
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None
+        ).await;
+        Ok(Self::Client { ws_stream, peer_addr })
     }
 
     pub async fn accept(listener: &TcpListener) -> io::Result<Self> {
@@ -129,10 +139,18 @@ impl WsTransport {
         let peer_addr = addr;
         log::info!("Attempting WebSocket connection from {}", addr);
 
-        Ok(Self {
-            framed: Framed::new(stream, ByteCodec::new()),
-            peer_addr,
-        })
+        // Perform WebSocket handshake
+        let ws_stream = match accept_async(stream).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                log::error!("WebSocket handshake failed from {}: {}", addr, e);
+                return Err(io::Error::new(io::ErrorKind::ConnectionRefused, e));
+            }
+        };
+
+        log::info!("WebSocket connection established from {}", addr);
+
+        Ok(Self::Server { ws_stream, peer_addr })
     }
 
     pub async fn bind(addr: &str) -> io::Result<TcpListener> {
@@ -140,13 +158,16 @@ impl WsTransport {
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+        match self {
+            Self::Client { peer_addr, .. } => *peer_addr,
+            Self::Server { peer_addr, .. } => *peer_addr,
+        }
     }
 
     pub async fn connect(url: &str) -> io::Result<Self> {
         log::info!("Connecting to WebSocket server at {}", url);
 
-        let (_ws_stream, _) = match connect_async(url).await {
+        let (ws_stream, _response) = match connect_async(url).await {
             Ok(conn) => conn,
             Err(e) => {
                 log::error!("Failed to connect to WebSocket server {}: {}", url, e);
@@ -155,21 +176,24 @@ impl WsTransport {
         };
         log::info!("Connected to WebSocket server");
 
-        let parsed_url = url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("ws://localhost:8080").unwrap());
-        let host = parsed_url.host_str().unwrap_or("localhost");
-        let port = parsed_url.port_or_known_default().unwrap_or(8080);
-        let server_addr = format!("{}:{}", host, port).parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
+        // Extract peer address from URL
+        let server_addr = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed_url: url::Url| {
+                let host = parsed_url.host_str().unwrap_or("localhost");
+                let port = parsed_url.port_or_known_default().unwrap_or(80);
+                format!("{}:{}", host, port).parse().ok()
+            })
+            .unwrap_or_else(|| "127.0.0.1:80".parse().unwrap());
 
-        let stream = TcpStream::connect(server_addr).await?;
-
-        Ok(Self {
-            framed: Framed::new(stream, ByteCodec::new()),
-            peer_addr: server_addr,
-        })
+        Ok(Self::Client { ws_stream, peer_addr: server_addr })
     }
 
     pub fn server_addr(&self) -> SocketAddr {
-        self.peer_addr
+        match self {
+            Self::Client { peer_addr, .. } => *peer_addr,
+            Self::Server { peer_addr, .. } => *peer_addr,
+        }
     }
 }
 
@@ -177,11 +201,94 @@ impl TransportTrait for WsTransport {
     type Error = io::Error;
 
     async fn send(&mut self, msg: Message, _addr: SocketAddr) -> Result<(), Self::Error> {
-        self.framed.send(msg).await
+        // Serialize Message to bytes and send as WebSocket binary message
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let ws_msg = WsMessage::Binary(bytes);
+
+        match self {
+            Self::Client { ws_stream, .. } => {
+                ws_stream.send(ws_msg).await
+                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+            }
+            Self::Server { ws_stream, .. } => {
+                ws_stream.send(ws_msg).await
+                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+            }
+        }
     }
 
     async fn next(&mut self) -> Option<Result<(Message, SocketAddr), Self::Error>> {
-        let result = self.framed.next().await;
-        result.map(|r| r.map(|msg| (msg, self.peer_addr)))
+        loop {
+            match self {
+                Self::Client { ws_stream, peer_addr } => {
+                    match ws_stream.next().await {
+                        Some(Ok(ws_msg)) => {
+                            match ws_msg {
+                                WsMessage::Binary(bytes) => {
+                                    // Deserialize Message from bytes
+                                    match bincode::deserialize::<Message>(&bytes) {
+                                        Ok(msg) => return Some(Ok((msg, *peer_addr))),
+                                        Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+                                    }
+                                }
+                                WsMessage::Close(_) => return None,
+                                WsMessage::Ping(data) => {
+                                    // Respond to ping with pong and continue
+                                    if let Err(e) = ws_stream.send(WsMessage::Pong(data)).await {
+                                        return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                                    }
+                                    // Continue to next message
+                                    continue;
+                                }
+                                WsMessage::Pong(_) => {
+                                    // Ignore pongs, continue to next message
+                                    continue;
+                                }
+                                WsMessage::Text(_) | WsMessage::Frame(_) => {
+                                    return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported WebSocket message type")));
+                                }
+                            }
+                        }
+                        Some(Err(e)) => return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
+                        None => return None,
+                    }
+                }
+                Self::Server { ws_stream, peer_addr } => {
+                    match ws_stream.next().await {
+                        Some(Ok(ws_msg)) => {
+                            match ws_msg {
+                                WsMessage::Binary(bytes) => {
+                                    // Deserialize Message from bytes
+                                    match bincode::deserialize::<Message>(&bytes) {
+                                        Ok(msg) => return Some(Ok((msg, *peer_addr))),
+                                        Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+                                    }
+                                }
+                                WsMessage::Close(_) => return None,
+                                WsMessage::Ping(data) => {
+                                    // Respond to ping with pong and continue
+                                    if let Err(e) = ws_stream.send(WsMessage::Pong(data)).await {
+                                        return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                                    }
+                                    // Continue to next message
+                                    continue;
+                                }
+                                WsMessage::Pong(_) => {
+                                    // Ignore pongs, continue to next message
+                                    continue;
+                                }
+                                WsMessage::Text(_) | WsMessage::Frame(_) => {
+                                    return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported WebSocket message type")));
+                                }
+                            }
+                        }
+                        Some(Err(e)) => return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
+                        None => return None,
+                    }
+                }
+            }
+        }
     }
 }
