@@ -1,5 +1,5 @@
 use crate::common::{ClientConfig, tun_io_task, print_packet_info};
-use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
+use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType};
 use crate::tun_config::{TunConfig, deserialize_tun_config, create_tun_device};
 use anyhow::Result;
@@ -225,6 +225,36 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
+pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transport: WsTransport, client_id: u32) -> Result<()> {
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
+
+    let server_addr = transport.server_addr();
+
+    let tun_handle = tokio::spawn(
+        tun_io_task(
+            tun,
+            tun_tx,
+            transport_rx
+        )
+    );
+    let transport_handle = tokio::spawn(
+        transport_io_task(
+            transport,
+            server_addr,
+            client_id,
+            tun_rx,
+            transport_tx,
+        )
+    );
+
+    tokio::select! {
+        _ = tun_handle => {},
+        _ = transport_handle => {},
+    }
+    Ok(())
+}
+
 pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<()> {
     info!("Connecting to server to get TUN configuration...");
 
@@ -242,7 +272,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
         }
         "udp" => {
             info!("Using UDP transport");
-            
+
             let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
             let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
 
@@ -250,6 +280,20 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             let tun_device = create_tun_device(&tun_config)?;
 
             run_udp_client(config, tun_device, transport, client_id).await?;
+        }
+        "ws" => {
+            info!("Using WebSocket transport");
+
+            // Construct WS URL from server address
+            let ws_url = format!("ws://{}", config.server_addr);
+            let mut transport = WsTransport::connect(&ws_url).await?;
+            let server_addr = transport.server_addr();
+            let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
+
+            info!("Creating TUN device with server config: {}", tun_config.name);
+            let tun_device = create_tun_device(&tun_config)?;
+
+            run_ws_client(config, tun_device, transport, client_id).await?;
         }
         _ => {
             error!("Unknown transport type: {}", transport_type);

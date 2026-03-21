@@ -1,5 +1,5 @@
 use crate::common::{ServerConfig, print_packet_info, tun_io_task};
-use crate::transport::{TransportTrait, TcpTransport, UdpTransport};
+use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType};
 use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
 use anyhow::Result;
@@ -344,6 +344,125 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     Ok(())
 }
 
+async fn handle_ws_connection(
+    mut ws_transport: WsTransport,
+    client_id: u32,
+    transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    clients: Arc<Mutex<HashMap<u32, Client>>>,
+) {
+    let peer_addr = ws_transport.peer_addr();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+
+    loop {
+        tokio::select! {
+            result = ws_transport.next() => {
+                match result {
+                    Some(Ok((msg, src_addr))) => {
+                        match MessageType::try_from(msg.message_type) {
+                            Ok(MessageType::Handshake) => {
+                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id).await;
+                            }
+                            Ok(MessageType::Data) => {
+                                handle_data(&msg.data, &transport_tx).await;
+                            }
+                            Ok(MessageType::KeepAlive) => {
+                                handle_keepalive(src_addr, &mut ws_transport, msg.data).await;
+                            }
+                            Ok(MessageType::Disconnect) => {
+                                handle_disconnect(src_addr, &clients).await;
+                            }
+                            _ => {
+                                warn!("Unknown message type from {}: {}", src_addr, msg.message_type);
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("Error reading message from {}: {}", peer_addr, e);
+                        break;
+                    }
+                    None => {
+                        info!("WS client {} disconnected", peer_addr);
+                        break;
+                    }
+                }
+            }
+
+            result = client_rx.recv() => {
+                match result {
+                    Some(data) => {
+                        print_packet_info("[transport write]", &data);
+                        let message = Message::data(data);
+                        if let Err(e) = ws_transport.send(message, peer_addr).await {
+                            warn!("Failed to send data to WS client {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut clients_map = clients.lock().await;
+    clients_map.remove(&client_id);
+}
+
+async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
+    let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
+
+    let tun_handle = tokio::spawn(
+        tun_io_task(
+            tun,
+            tun_tx,
+            transport_rx
+        )
+    );
+
+    let clients_clone = Arc::clone(&clients);
+    tokio::spawn(async move {
+        handle_tun_packet(&mut tun_rx, &clients_clone).await;
+    });
+
+    let accept_task = tokio::spawn(async move {
+        let listener = WsTransport::bind(config.bind_addr.to_string().as_str()).await
+            .expect("Failed to bind to address");
+        info!("WebSocket server listening on {}", config.bind_addr);
+
+        loop {
+            match WsTransport::accept(&listener).await {
+                Ok(ws_transport) => {
+                    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+
+                    let tx = transport_tx.clone();
+                    let clients = Arc::clone(&clients);
+
+                    tokio::spawn(async move {
+                        handle_ws_connection(
+                            ws_transport,
+                            client_id,
+                            tx,
+                            clients,
+                        ).await
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to accept WS connection: {}", e);
+                }
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = tun_handle => {},
+        _ = accept_task => {},
+    }
+    Ok(())
+}
+
 pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<()> {
     let mut tun_config = Configuration::default();
     tun_config
@@ -363,6 +482,10 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
         "udp" => {
             info!("Using UDP transport");
             run_udp_server(config, tun).await
+        }
+        "ws" => {
+            info!("Using WebSocket transport");
+            run_ws_server(config, tun).await
         }
         _ => {
             error!("Unknown transport type: {}", transport_type);

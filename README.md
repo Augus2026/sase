@@ -47,7 +47,7 @@ SASE (Simple And Secure VPN) 是一个使用 Rust 编写的现代 VPN 解决方�
 
 ### 技术特性
 
-- ✅ **多协议支持** - UDP 和 TCP 传输协议
+- ✅ **多协议支持** - UDP、TCP 和 WS (WebSocket) 传输协议
 - ✅ **TUN/TAP 接口** - 支持第 3 层网络隧道
 - ✅ **异步 I/O** - 基于 Tokio 的高性能异步处理
 - ✅ **自定义协议** - 高效的二进制数据封装
@@ -64,6 +64,7 @@ SASE (Simple And Secure VPN) 是一个使用 Rust 编写的现代 VPN 解决方�
 | 运行时 | Tokio | 1.40 |
 | 网络接口 | tun2 | 4.0 |
 | 协议解析 | etherparse | 0.19 |
+| WebSocket | tokio-tungstenite | 0.24 |
 | CLI 框架 | clap | 4.5 |
 | 序列化 | serde | 1.0 |
 
@@ -193,13 +194,20 @@ sase server \
   --bind 0.0.0.0:9999 \
   --tun tun1 \
   --address 10.0.0.1
+
+# WS 协议示例
+sase server \
+  --transport ws \
+  --bind 0.0.0.0:8443 \
+  --tun tun2 \
+  --address 10.0.0.1
 ```
 
 **服务器参数说明：**
 
 | 参数 | 简写 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--transport` | 无 | `tcp` | 传输协议 (tcp/udp) |
+| `--transport` | 无 | `tcp` | 传输协议 (tcp/udp/ws) |
 | `--bind` | `-b` | `0.0.0.0:12345` | 监听地址和端口 |
 | `--tun` | `-u` | `tun0` | TUN 设备名称 |
 | `--address` | `-a` | `10.0.0.1` | TUN 设备 IP 地址 |
@@ -225,11 +233,24 @@ sase client \
   --log-level debug
 ```
 
+# 完整配置示例
+sase client \
+  --transport udp \
+  --server 192.168.1.100:9999 \
+  --log-level debug
+
+# WS 协议示例
+sase client \
+  --transport ws \
+  --server 192.168.1.100:8443 \
+  --log-level debug
+```
+
 **客户端参数说明：**
 
 | 参数 | 简写 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--transport` | 无 | `tcp` | 传输协议 (tcp/udp) |
+| `--transport` | 无 | `tcp` | 传输协议 (tcp/udp/ws) |
 | `--server` | `-s` | `127.0.0.1:12345` | 服务器地址和端口 |
 | `--log-level` | `-l` | `info` | 日志级别 |
 
@@ -313,6 +334,12 @@ pub struct Message {
 - 低延迟，高性能
 - 适合稳定网络环境
 - 需要应用层可靠性保证
+
+#### WS (WebSocket) 传输
+- 基于 WebSocket 协议的安全传输
+- 适合通过代理和防火墙的场景
+- 支持 TLS 加密（需要配置证书，使用 wss:// 前缀）
+- 跨浏览器兼容性强
 
 ---
 
@@ -411,7 +438,7 @@ SASE/
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| 传输协议 | `tcp` | TCP 连接 |
+| 传输协议 | `tcp` | TCP 连接 (支持 tcp/udp/ws) |
 | 绑定地址 | `0.0.0.0:12345` | 监听所有网络接口 |
 | TUN 设备 | `tun0` | 虚拟网络设备 |
 | TUN 地址 | `10.0.0.1` | 虚拟网络 IP |
@@ -422,7 +449,7 @@ SASE/
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| 传输协议 | `tcp` | TCP 连接 |
+| 传输协议 | `tcp` | TCP 连接 (支持 tcp/udp/ws) |
 | 服务器地址 | `127.0.0.1:12345` | 本地服务器 |
 | TUN 设备 | `tun0` | 虚拟网络设备 |
 | TUN 地址 | `10.0.0.2` | 虚拟网络 IP |
@@ -546,6 +573,7 @@ valgrind --leak-check=full ./target/release/sase server
 - [x] 基础 TUN/TAP 接口支持
 - [x] TCP 传输协议实现
 - [x] UDP 传输协议实现
+- [x] WS (WebSocket) 传输协议实现
 - [x] 客户端-服务器架构
 - [x] 握手和保活机制
 - [x] 统一 CLI 界面
