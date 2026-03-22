@@ -240,12 +240,6 @@ impl WsTransport {
         Ok((host, port, use_tls))
     }
 
-    async fn establish_tcp_connection(host: &str, port: u16) -> io::Result<TcpStream> {
-        TcpStream::connect((host, port))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))
-    }
-
     async fn wrap_with_tls(tcp_stream: TcpStream, host: &str, ca_cert_path: &str) -> io::Result<MaybeTlsStream<TcpStream>> {
         log::info!("Establishing TLS connection to {} (with root certificate verification)", host);
 
@@ -292,16 +286,18 @@ impl WsTransport {
 
         let (host, port, use_tls) = Self::parse_url(url)?;
 
-        let tcp_stream = Self::establish_tcp_connection(&host, port).await?;
+        let host_str = host.as_str();
+        let tcp_stream = TcpStream::connect((host_str, port))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))?;
 
         let stream = if use_tls {
-            Self::wrap_with_tls(tcp_stream, &host, &Self::DEFAULT_CA_CERT_PATH).await?
+            Self::wrap_with_tls(tcp_stream, host_str, &Self::DEFAULT_CA_CERT_PATH).await?
         } else {
             MaybeTlsStream::Plain(tcp_stream)
         };
 
         let ws_stream = Self::perform_websocket_handshake(url, stream).await?;
-
         let server_addr = format!("{}:{}", host, port)
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:80".parse().unwrap());
@@ -338,23 +334,18 @@ impl TransportTrait for WsTransport {
                                 Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
                             }
                         }
-                        WsMessage::Close(_) => return None,
-                        WsMessage::Ping(data) => {
-                            if let Err(e) = self.ws_stream.send(WsMessage::Pong(data)).await {
-                                return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
-                            }
+                        _ => {
+                            log::warn!("Received unknown WebSocket message type: {:?}", ws_msg);
                             continue;
-                        }
-                        WsMessage::Pong(_) => {
-                            continue;
-                        }
-                        WsMessage::Text(_) | WsMessage::Frame(_) => {
-                            return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported WebSocket message type")));
                         }
                     }
                 }
-                Some(Err(e)) => return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
-                None => return None,
+                Some(Err(e)) => {
+                    return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                }
+                None => {
+                    return None;
+                }
             }
         }
     }
