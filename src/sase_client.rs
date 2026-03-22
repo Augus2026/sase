@@ -12,61 +12,55 @@ async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     server_addr: std::net::SocketAddr,
 ) -> Result<(u32, TunConfig)> {
-    info!("Connecting to server at {}", server_addr);
+    info!("Handshake with server at {}", server_addr);
     let handshake_message = Message::handshake(vec![]);
-    let mut retry_delay = Duration::from_secs(1);
-    let max_retry_delay = Duration::from_secs(300);
-    let mut attempt = 0u32;
 
-    loop {
-        attempt += 1;
-        info!("Handshake attempt {} to {}", attempt, server_addr);
+    transport.send(handshake_message, server_addr).await?;
 
-        transport.send(handshake_message.clone(), server_addr).await?;
+    let timeout = sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
 
-        let timeout = sleep(Duration::from_secs(5));
-        tokio::pin!(timeout);
+    tokio::select! {
+        result = transport.next() => {
+            match result {
+                Some(Ok((msg, addr))) => {
+                    if addr == server_addr {
+                        match MessageType::try_from(msg.message_type) {
+                            Ok(MessageType::Handshake) => {
+                                if msg.data.len() >= 4 {
+                                    let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                                    info!("Connected! Client ID: {}", client_id);
 
-        tokio::select! {
-            result = transport.next() => {
-                match result {
-                    Some(Ok((msg, addr))) => {
-                        if addr == server_addr {
-                            match MessageType::try_from(msg.message_type) {
-                                Ok(MessageType::Handshake) => {
-                                    if msg.data.len() >= 4 {
-                                        let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                                        info!("Connected! Client ID: {}", client_id);
-
-                                        if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
-                                            info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
-                                                  tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-                                            return Ok((client_id, tun_config));
-                                        } else {
-                                            return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
-                                        }
+                                    if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
+                                        info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
+                                              tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+                                        return Ok((client_id, tun_config));
+                                    } else {
+                                        return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
                                     }
-                                }
-                                _ => {
-                                    info!("Invalid handshake response: unexpected message type: {}", msg.message_type);
+                                } else {
+                                    return Err(anyhow::anyhow!("Handshake response too short: expected at least 4 bytes"));
                                 }
                             }
+                            _ => {
+                                return Err(anyhow::anyhow!("Invalid handshake response: unexpected message type: {}", msg.message_type));
+                            }
                         }
+                    } else {
+                        return Err(anyhow::anyhow!("Handshake response from unexpected address: {}", addr));
                     }
-                    Some(Err(e)) => {
-                        info!("Error during handshake attempt {}: {}", attempt, e);
-                    }
-                    None => {}
+                }
+                Some(Err(e)) => {
+                    return Err(anyhow::anyhow!("Error during handshake: {}", e));
+                }
+                None => {
+                    return Err(anyhow::anyhow!("Transport closed during handshake"));
                 }
             }
-            _ = &mut timeout => {
-                info!("Handshake attempt {} timed out", attempt);
-            }
         }
-
-        warn!("Connection failed, retrying in {}s...", retry_delay.as_secs());
-        sleep(retry_delay).await;
-        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+        _ = &mut timeout => {
+            return Err(anyhow::anyhow!("Handshake timed out"));
+        }
     }
 }
 
@@ -316,6 +310,30 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     Ok(())
 }
 
+async fn run_client_with_retry(config: ClientConfig) -> Result<()> {
+    let mut retry_delay = Duration::from_secs(1);
+    let max_retry_delay = Duration::from_secs(300);
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+        info!("Client connection attempt {}...", attempt);
+
+        match run_client(config.clone()).await {
+            Ok(()) => {
+                info!("Client completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Client attempt {} failed: {}", attempt, e);
+                warn!("Retrying in {}s...", retry_delay.as_secs());
+                sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+            }
+        }
+    }
+}
+
 pub async fn run_client_with_args(
     transport_type: Option<String>,
     server_addr: Option<String>,
@@ -337,5 +355,5 @@ pub async fn run_client_with_args(
 
     info!("Client configuration: {:?}", config);
 
-    run_client(config).await
+    run_client_with_retry(config).await
 }
