@@ -1,7 +1,6 @@
 use crate::common::{ServerConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive, TunConfig};
-use crate::tun_config::build_tun_config;
 use anyhow::Result;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -10,15 +9,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
+use nanoid;
 
 #[derive(Clone)]
 struct Client {
+    session_id: String,
     addr: SocketAddr,
     virtual_ip: Ipv4Addr,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn build_session_id() -> String {
+    format!("{}", nanoid::nanoid!(21))
+}
 
 fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
     if data.len() < 20 {
@@ -62,20 +67,20 @@ async fn handle_handshake(
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     client_id: u32,
 ) {
-    let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
-    let tun_config = build_tun_config(client_id, &virtual_ip.to_string());
+    let session_id = build_session_id();
 
-    let proto_tun_config = TunConfig {
-        name: tun_config.name.clone(),
-        address: tun_config.address.clone(),
-        netmask: tun_config.netmask.clone(),
-        dns: tun_config.dns.clone(),
-        mtu: tun_config.mtu,
+    let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
+    let tun_config = TunConfig {
+        name: format!("tun{}", client_id),
+        address: virtual_ip.to_string(),
+        netmask: "255.255.255.0".to_string(),
+        dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
+        mtu: 1400,
     };
 
     let message = Message::handshake(Handshake {
-        session_id: format!("{}", client_id),
-        tun_config: Some(proto_tun_config),
+        session_id: session_id.clone(),
+        tun_config: Some(tun_config),
     });
 
     if let Err(e) = transport.send(message, src_addr).await {
@@ -84,6 +89,7 @@ async fn handle_handshake(
     }
 
     let client = Client {
+        session_id: session_id.clone(),
         addr: src_addr,
         virtual_ip,
         tx: client_tx,
