@@ -120,21 +120,13 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    const DEFAULT_CERT_PATH: &'static str = "certs/server-cert.pem";
-    const DEFAULT_KEY_PATH: &'static str = "certs/server-key.pem";
-    const DEFAULT_CA_CERT_PATH: &'static str = "certs/ca-cert.pem";
-
-    pub fn create_default_tls_acceptor() -> io::Result<TlsAcceptor> {
-        Self::create_tls_acceptor(&Self::DEFAULT_CERT_PATH, &Self::DEFAULT_KEY_PATH)
-    }
-
     pub fn create_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
         let resolve_path = |path: &str, default: &'static str| -> String {
             if Path::new(path).exists() { path.to_string() } else { default.to_string() }
         };
 
-        let cert_path = resolve_path(cert_path, Self::DEFAULT_CERT_PATH);
-        let key_path = resolve_path(key_path, Self::DEFAULT_KEY_PATH);
+        let cert_path = resolve_path(cert_path, "certs/server-cert.pem");
+        let key_path = resolve_path(key_path, "certs/server-key.pem");
 
         if !Path::new(&cert_path).exists() || !Path::new(&key_path).exists() {
             return Err(io::Error::new(
@@ -230,7 +222,7 @@ impl WsTransport {
         Ok(MaybeTlsStream::NativeTls(tls_stream))
     }
 
-    pub async fn connect(url: &str) -> io::Result<Self> {
+    pub async fn connect(url: &str, ca_cert_path: &str) -> io::Result<Self> {
         let (host, port, use_tls) = Self::parse_url(url)?;
 
         let tcp_stream = TcpStream::connect((&*host, port))
@@ -238,7 +230,7 @@ impl WsTransport {
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}:{}", host, e)))?;
 
         let stream = if use_tls {
-            Self::wrap_with_tls(tcp_stream, &host, Self::DEFAULT_CA_CERT_PATH).await?
+            Self::wrap_with_tls(tcp_stream, &host, ca_cert_path).await?
         } else {
             MaybeTlsStream::Plain(tcp_stream)
         };

@@ -24,7 +24,10 @@ struct Cli {
 enum Commands {
     Server {
         #[arg(short, long)]
-        bind: Option<String>,
+        transport_type: Option<String>,
+
+        #[arg(short, long)]
+        bind_addr: Option<String>,
 
         #[arg(short = 'u', long)]
         tun: Option<String>,
@@ -39,14 +42,20 @@ enum Commands {
         mtu: Option<usize>,
 
         #[arg(short, long)]
-        transport: Option<String>,
+        cert_path: Option<String>,
+
+        #[arg(short, long)]
+        key_path: Option<String>,
     },
     Client {
         #[arg(short, long)]
-        server: Option<String>,
+        transport_type: Option<String>,
 
         #[arg(short, long)]
-        transport: Option<String>,
+        server_addr: Option<String>,
+
+        #[arg(short, long)]
+        ca_cert_path: Option<String>,
     },
 }
 
@@ -57,12 +66,14 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server {
-            bind,
+            transport_type,
+            bind_addr,
             tun,
             address,
             netmask,
             mtu,
-            transport,
+            cert_path,
+            key_path,
         } => {
             env_logger::Builder::from_env(
                 env_logger::Env::default().default_filter_or(log_level),
@@ -70,11 +81,12 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Server");
-            sase_server::run_server_with_args(bind, tun, address, netmask, mtu, transport).await
+            sase_server::run_server_with_args(transport_type, bind_addr, tun, address, netmask, mtu, cert_path, key_path).await
         }
         Commands::Client {
-            server,
-            transport,
+            transport_type,
+            server_addr,
+            ca_cert_path,
         } => {
             env_logger::Builder::from_env(
                 env_logger::Env::default().default_filter_or(log_level),
@@ -82,7 +94,7 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Client");
-            sase_client::run_client_with_args(server, transport).await
+            sase_client::run_client_with_args(transport_type, server_addr, ca_cert_path).await
         }
     }
 }

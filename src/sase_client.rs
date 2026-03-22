@@ -255,10 +255,10 @@ pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
-pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<()> {
+pub async fn run_client(config: ClientConfig) -> Result<()> {
     info!("Connecting to server to get TUN configuration...");
 
-    match transport_type.to_lowercase().as_str() {
+    match config.transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
 
@@ -285,7 +285,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             info!("Using WebSocket transport");
 
             let ws_url = format!("ws://{}", config.server_addr);
-            let mut transport = WsTransport::connect(&ws_url).await?;
+            let mut transport = WsTransport::connect(&ws_url, &config.ca_cert_path).await?;
             let server_addr = transport.server_addr();
             let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
 
@@ -298,7 +298,7 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             info!("Using WebSocket(Secure) transport");
 
             let wss_url = format!("wss://{}", config.server_addr);
-            let mut transport = WsTransport::connect(&wss_url).await?;
+            let mut transport = WsTransport::connect(&wss_url, &config.ca_cert_path).await?;
             let server_addr = transport.server_addr();
             let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
 
@@ -308,8 +308,8 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             run_ws_client(config, tun_device, transport, client_id).await?;
         }
         _ => {
-            error!("Unknown transport type: {}", transport_type);
-            return Err(anyhow::anyhow!("Unknown transport type: {}", transport_type));
+            error!("Unknown transport type: {}", config.transport_type);
+            return Err(anyhow::anyhow!("Unknown transport type: {}", config.transport_type));
         }
     }
 
@@ -317,18 +317,25 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
 }
 
 pub async fn run_client_with_args(
-    server: Option<String>,
-    transport: Option<String>,
+    transport_type: Option<String>,
+    server_addr: Option<String>,
+    ca_cert_path: Option<String>,
 ) -> Result<()> {
     let mut config = ClientConfig::default();
-    let transport_type = transport.unwrap_or_else(|| "udp".to_string());
 
-    if let Some(server) = server {
-        config.server_addr = server.parse()?;
+    if let Some(transport_type) = transport_type {
+        config.transport_type = transport_type;
+    }
+
+    if let Some(server_addr) = server_addr {
+        config.server_addr = server_addr.parse()?;
+    }
+
+    if let Some(ca_cert_path) = ca_cert_path {
+        config.ca_cert_path = ca_cert_path;
     }
 
     info!("Client configuration: {:?}", config);
-    info!("Transport protocol: {}", transport_type);
 
-    run_client(config, transport_type).await
+    run_client(config).await
 }

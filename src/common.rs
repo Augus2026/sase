@@ -9,34 +9,44 @@ pub const TUN_MTU: usize = 1500;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
+    pub transport_type: String,
     pub server_addr: SocketAddr,
+    pub ca_cert_path: String,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            transport_type: "udp".to_string(),
             server_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT).parse().unwrap(),
+            ca_cert_path: "certs/ca-cert.pem".to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub transport_type: String,
     pub bind_addr: SocketAddr,
     pub tun_name: String,
     pub tun_addr: Ipv4Addr,
     pub tun_netmask: Ipv4Addr,
     pub mtu: usize,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            transport_type: "udp".to_string(),
             bind_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT).parse().unwrap(),
             tun_name: TUN_NAME.to_string(),
             tun_addr: Ipv4Addr::new(10, 0, 0, 1),
             tun_netmask: Ipv4Addr::new(255, 255, 255, 0),
             mtu: TUN_MTU,
+            cert_path: "certs/server-cert.pem".to_string(),
+            key_path: "certs/server-key.pem".to_string(),
         }
     }
 }

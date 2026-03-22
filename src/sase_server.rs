@@ -414,6 +414,12 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
 
+    let tls_acceptor = if config.transport_type == "wss" {
+        Some(WsTransport::create_tls_acceptor(&config.cert_path, &config.key_path).unwrap())
+    } else {
+        None
+    };
+
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
@@ -430,19 +436,6 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
     let accept_task = tokio::spawn(async move {
         let listener = WsTransport::bind(config.bind_addr.to_string().as_str()).await
             .expect("Failed to bind to address");
-
-        // Try to create TLS acceptor from default certificate paths
-        let tls_acceptor = match WsTransport::create_default_tls_acceptor() {
-            Ok(acceptor) => {
-                info!("WSS (WebSocket Secure) server listening on {}", config.bind_addr);
-                Some(acceptor)
-            }
-            Err(e) => {
-                warn!("Failed to create TLS acceptor: {}, falling back to plain WebSocket", e);
-                info!("WebSocket server listening on {}", config.bind_addr);
-                None
-            }
-        };
 
         loop {
             match WsTransport::accept(&listener, tls_acceptor.as_ref().map(|a| a.clone())).await {
@@ -475,7 +468,7 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
     Ok(())
 }
 
-pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<()> {
+pub async fn run_server(config: ServerConfig) -> Result<()> {
     let mut tun_config = Configuration::default();
     tun_config
         .tun_name(&config.tun_name)
@@ -486,7 +479,7 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
         .up();
     let tun = create_as_async(&tun_config)?;
 
-    match transport_type.to_lowercase().as_str() {
+    match config.transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
             run_tcp_server(config, tun).await
@@ -499,26 +492,35 @@ pub async fn run_server(config: ServerConfig, transport_type: String) -> Result<
             info!("Using WebSocket transport");
             run_ws_server(config, tun).await
         }
+        "wss" => {
+            info!("Using WebSocket(Secure) transport");
+            run_ws_server(config, tun).await
+        }
         _ => {
-            error!("Unknown transport type: {}", transport_type);
-            Err(anyhow::anyhow!("Unknown transport type: {}", transport_type))
+            error!("Unknown transport type: {}", config.transport_type);
+            Err(anyhow::anyhow!("Unknown transport type: {}", config.transport_type))
         }
     }
 }
 
 pub async fn run_server_with_args(
-    bind: Option<String>,
+    transport_type: Option<String>,
+    bind_addr: Option<String>,
     tun: Option<String>,
     address: Option<String>,
     netmask: Option<String>,
     mtu: Option<usize>,
-    transport: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
 ) -> Result<()> {
     let mut config = ServerConfig::default();
-    let transport_type = transport.unwrap_or_else(|| "udp".to_string());
 
-    if let Some(bind) = bind {
-        config.bind_addr = bind.parse()?;
+    if let Some(transport_type) = transport_type {
+        config.transport_type = transport_type;
+    }
+
+    if let Some(bind_addr) = bind_addr {
+        config.bind_addr = bind_addr.parse()?;
     }
 
     if let Some(tun) = tun {
@@ -537,8 +539,15 @@ pub async fn run_server_with_args(
         config.mtu = mtu;
     }
 
-    info!("Server configuration: {:?}", config);
-    info!("Transport protocol: {}", transport_type);
+    if let Some(cert_path) = cert_path {
+        config.cert_path = cert_path;
+    }
 
-    run_server(config, transport_type).await
+    if let Some(key_path) = key_path {
+        config.key_path = key_path;
+    }
+
+    info!("Server configuration: {:?}", config);
+
+    run_server(config).await
 }
