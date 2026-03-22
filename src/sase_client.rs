@@ -1,4 +1,4 @@
-use crate::common::{ClientConfig, tun_io_task, print_packet_info};
+use crate::common::{ClientConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType};
 use crate::tun_config::{TunConfig, deserialize_tun_config, create_tun_device};
@@ -23,7 +23,7 @@ async fn handshake_async(
     tokio::select! {
         result = transport.next() => {
             match result {
-                Some(Ok((msg, addr))) => {
+                Some(Ok((msg, _addr))) => {
                     match MessageType::try_from(msg.message_type) {
                         Ok(MessageType::Handshake) => {
                             if msg.data.len() >= 4 {
@@ -74,10 +74,9 @@ where
         tokio::select! {
             result = transport.next() => {
                 match result {
-                    Some(Ok((msg, addr))) => {
+                    Some(Ok((msg, _addr))) => {
                         match MessageType::try_from(msg.message_type) {
                             Ok(MessageType::Data) => {
-                                print_packet_info("[transport recv]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
                                     return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
                                 }
@@ -118,7 +117,6 @@ where
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
-                        print_packet_info("[transport send]", &data);
                         let message = Message::data(data);
                         if let Err(e) = transport.send(message, server_addr).await {
                             return Err(anyhow::anyhow!("Failed to send to server: {}", e));

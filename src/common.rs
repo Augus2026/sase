@@ -51,86 +51,6 @@ impl Default for ServerConfig {
     }
 }
 
-#[allow(dead_code)]
-pub fn print_packet_info(prefix: &str, data: &[u8]) {
-    if data.len() < 20 {
-        warn!("{}: Packet too short ({:?} bytes)", prefix, data);
-        return;
-    }
-
-    let ihl = ((data[0] & 0x0F) as usize) * 4;
-    let protocol = data[9];
-    let src_ip = std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]);
-    let dst_ip = std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
-
-    let proto_name = match protocol {
-        1 => "ICMP".to_string(),
-        6 => "TCP".to_string(),
-        17 => "UDP".to_string(),
-        _ => format!("Unknown({})", protocol),
-    };
-    debug!("{}: {} {} -> {} ({} bytes)", prefix, proto_name, src_ip, dst_ip, data.len());
-
-    match protocol {
-        1 => {
-            if data.len() >= ihl + 8 {
-                let icmp_type = data[ihl];
-                let icmp_code = data[ihl + 1];
-                let checksum = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
-                let id = u16::from_be_bytes([data[ihl + 4], data[ihl + 5]]);
-                let seq = u16::from_be_bytes([data[ihl + 6], data[ihl + 7]]);
-
-                let type_name = match icmp_type {
-                    0 => "Echo Reply",
-                    3 => "Destination Unreachable",
-                    5 => "Redirect",
-                    8 => "Echo Request",
-                    11 => "Time Exceeded",
-                    _ => "Unknown",
-                };
-                debug!("  └─ ICMP {} | type={}, code={}, checksum={}, id={}, seq={}",
-                    type_name, icmp_type, icmp_code, checksum, id, seq);
-            }
-        }
-        6 => {
-            if data.len() >= ihl + 20 {
-                let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
-                let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
-                let seq = u32::from_be_bytes([data[ihl + 4], data[ihl + 5], data[ihl + 6], data[ihl + 7]]);
-                let ack_num = u32::from_be_bytes([data[ihl + 8], data[ihl + 9], data[ihl + 10], data[ihl + 11]]);
-                let flags = data[ihl + 13];
-                let syn = (flags & 0x02) != 0;
-                let ack_flag = (flags & 0x10) != 0;
-                let fin = (flags & 0x01) != 0;
-                let rst = (flags & 0x04) != 0;
-                let psh = (flags & 0x08) != 0;
-                debug!("  └─ TCP {} -> {} | SEQ={} ACK={} | flags:{}{}{}{}{}",
-                    src_port, dst_port, seq, ack_num,
-                    if syn { " SYN" } else { "" },
-                    if ack_flag { " ACK" } else { "" },
-                    if fin { " FIN" } else { "" },
-                    if rst { " RST" } else { "" },
-                    if psh { " PSH" } else { "" });
-            }
-        }
-        17 => {
-            if data.len() >= ihl + 8 {
-                let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
-                let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
-                let length = u16::from_be_bytes([data[ihl + 4], data[ihl + 5]]);
-                debug!("  └─ UDP {} -> {} | length={}", src_port, dst_port, length);
-            }
-        }
-        _ => {
-            let hex_dump: Vec<String> = data.iter()
-                .take(32)
-                .map(|b| format!("{:02x}", b))
-                .collect();
-            debug!("  └─ Raw header bytes: {}", hex_dump.join(" "));
-        }
-    }
-}
-
 pub async fn tun_io_task(
     mut tun: tun2::AsyncDevice,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -142,7 +62,6 @@ pub async fn tun_io_task(
             result = transport_rx.recv() => {
                 match result {
                     Some(data) => {
-                        print_packet_info("[tun write]", &data);
                         if let Err(e) = tun.write_all(&data).await {
                             return Err(anyhow::anyhow!("Failed to write to TUN: {}", e));
                         }
@@ -157,7 +76,6 @@ pub async fn tun_io_task(
                 match result {
                     Ok(n) => {
                         let data = tun_buf[..n].to_vec();
-                        print_packet_info("[tun read]", &data);
                         if let Err(e) = tun_tx.send(data).await {
                             return Err(anyhow::anyhow!("Failed to send to transport: {}", e));
                         }

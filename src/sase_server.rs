@@ -1,4 +1,4 @@
-use crate::common::{ServerConfig, print_packet_info, tun_io_task};
+use crate::common::{ServerConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType};
 use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
@@ -40,7 +40,6 @@ async fn handle_data(
     data: &[u8],
     transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    print_packet_info("[transport read]", &data);
     if let Err(e) = transport_tx.send(data.to_vec()).await {
         warn!("Failed to send to transport writer: {}", e);
     }
@@ -110,7 +109,6 @@ async fn handle_tun_packet(
         if let Some(dest_ip) = get_destination_ip(&data) {
             let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
             if let Some(client) = target_client {
-                print_packet_info("[transport write]", &data);
                 if let Err(e) = client.tx.send(data).await {
                     warn!("Failed to send to client {}: {}", client.addr, e);
                 }
@@ -124,7 +122,6 @@ async fn send_to_client(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     client: &Client,
 ) {
-    print_packet_info("[transport write]", &data);
     let message = Message::data(data.to_vec());
     if let Err(e) = transport.send(message, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
@@ -271,7 +268,6 @@ async fn handle_tcp_connection(
             result = client_rx.recv() => {
                 match result {
                     Some(data) => {
-                        print_packet_info("[transport write]", &data);
                         let message = Message::data(data);
                         if let Err(e) = tcp_transport.send(message, peer_addr).await {
                             warn!("Failed to send data to {}: {}", peer_addr, e);
@@ -390,7 +386,6 @@ async fn handle_ws_connection(
             result = client_rx.recv() => {
                 match result {
                     Some(data) => {
-                        print_packet_info("[transport write]", &data);
                         let message = Message::data(data);
                         if let Err(e) = ws_transport.send(message, peer_addr).await {
                             warn!("Failed to send data to WS client {}: {}", peer_addr, e);
