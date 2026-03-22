@@ -432,17 +432,20 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
             .expect("Failed to bind to address");
 
         // Try to create TLS acceptor from default certificate paths
-        let tls_acceptor = WsTransport::try_create_default_tls_acceptor()
-            .expect("Failed to create TLS acceptor");
-
-        if tls_acceptor.is_some() {
-            info!("WSS (WebSocket Secure) server listening on {}", config.bind_addr);
-        } else {
-            info!("WebSocket server listening on {}", config.bind_addr);
-        }
+        let tls_acceptor = match WsTransport::create_default_tls_acceptor() {
+            Ok(acceptor) => {
+                info!("WSS (WebSocket Secure) server listening on {}", config.bind_addr);
+                Some(acceptor)
+            }
+            Err(e) => {
+                warn!("Failed to create TLS acceptor: {}, falling back to plain WebSocket", e);
+                info!("WebSocket server listening on {}", config.bind_addr);
+                None
+            }
+        };
 
         loop {
-            match WsTransport::accept(&listener, tls_acceptor.clone()).await {
+            match WsTransport::accept(&listener, tls_acceptor.as_ref().map(|a| a.clone())).await {
                 Ok(ws_transport) => {
                     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
 

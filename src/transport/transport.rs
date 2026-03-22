@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 use tokio_util::codec::Framed;
 use tokio_util::udp::UdpFramed;
 use socket2::Socket;
-use tokio_tungstenite::{accept_async_with_config, connect_async_with_config, WebSocketStream, MaybeTlsStream};
+use tokio_tungstenite::{accept_async_with_config, WebSocketStream, MaybeTlsStream};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_native_tls::TlsAcceptor;
 use tokio_native_tls::TlsConnector;
@@ -120,13 +120,15 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    // Default paths for TLS certificates
     const DEFAULT_CERT_PATH: &'static str = "certs/server-cert.pem";
     const DEFAULT_KEY_PATH: &'static str = "certs/server-key.pem";
-    const DEFAULT_PKCS12_PATH: &'static str = "certs/server.p12";
+    const DEFAULT_CA_CERT_PATH: &'static str = "certs/ca-cert.pem";
 
-    /// Create a TLS acceptor from certificate and key files
-    pub fn create_tls_acceptor_from_pem(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
+    pub fn create_default_tls_acceptor() -> io::Result<TlsAcceptor> {
+        Self::create_tls_acceptor(&Self::DEFAULT_CERT_PATH, &Self::DEFAULT_KEY_PATH)
+    }
+
+    pub fn create_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
         let cert_path = if Path::new(cert_path).exists() {
             cert_path
         } else {
@@ -141,7 +143,6 @@ impl WsTransport {
             Self::DEFAULT_KEY_PATH
         };
 
-        // Check if default files exist
         if !Path::new(cert_path).exists() || !Path::new(key_path).exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -155,11 +156,9 @@ impl WsTransport {
         let key_pem = fs::read_to_string(key_path)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read key: {}", e)))?;
 
-        // Create identity from certificate and key
         let identity = Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to create identity: {}", e)))?;
 
-        // Create acceptor
         let acceptor = native_tls::TlsAcceptor::builder(identity)
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to create TLS acceptor: {}", e)))?;
@@ -167,63 +166,6 @@ impl WsTransport {
         Ok(TlsAcceptor::from(acceptor))
     }
 
-    /// Create a TLS acceptor from PKCS12 file
-    pub fn create_tls_acceptor_from_pkcs12(pkcs12_path: &str, password: &str) -> io::Result<TlsAcceptor> {
-        let pkcs12_path = if Path::new(pkcs12_path).exists() {
-            pkcs12_path
-        } else {
-            log::warn!("PKCS12 file not found at {}, trying default path: {}", pkcs12_path, Self::DEFAULT_PKCS12_PATH);
-            Self::DEFAULT_PKCS12_PATH
-        };
-
-        if !Path::new(pkcs12_path).exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("PKCS12 file not found: {}", pkcs12_path)
-            ));
-        }
-
-        let pkcs12 = fs::read(pkcs12_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read PKCS12 file: {}", e)))?;
-
-        let identity = Identity::from_pkcs12(&pkcs12, password)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse PKCS12: {}", e)))?;
-
-        let acceptor = native_tls::TlsAcceptor::new(identity)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to create TLS acceptor: {}", e)))?;
-
-        Ok(TlsAcceptor::from(acceptor))
-    }
-
-    /// Try to create TLS acceptor from default certificate paths
-    pub fn try_create_default_tls_acceptor() -> io::Result<Option<TlsAcceptor>> {
-        // Try PEM files first
-        match Self::create_tls_acceptor_from_pem(Self::DEFAULT_CERT_PATH, Self::DEFAULT_KEY_PATH) {
-            Ok(acceptor) => {
-                log::info!("Using TLS certificates from {} and {}", Self::DEFAULT_CERT_PATH, Self::DEFAULT_KEY_PATH);
-                return Ok(Some(acceptor));
-            }
-            Err(e) => {
-                log::debug!("Failed to load PEM certificates: {}", e);
-            }
-        }
-
-        // Try PKCS12 file
-        if Path::new(Self::DEFAULT_PKCS12_PATH).exists() {
-            match Self::create_tls_acceptor_from_pkcs12(Self::DEFAULT_PKCS12_PATH, "") {
-                Ok(acceptor) => {
-                    log::info!("Using TLS certificate from {}", Self::DEFAULT_PKCS12_PATH);
-                    return Ok(Some(acceptor));
-                }
-                Err(e) => {
-                    log::debug!("Failed to load PKCS12 certificate: {}", e);
-                }
-            }
-        }
-
-        log::info!("No TLS certificates found, using plain TCP");
-        Ok(None)
-    }
     pub async fn new(stream: TcpStream) -> io::Result<Self> {
         let peer_addr = stream.peer_addr()?;
         let ws_stream = WebSocketStream::from_raw_socket(
@@ -243,11 +185,8 @@ impl WsTransport {
         } else {
             log::info!("Attempting WebSocket connection from {}", addr);
         }
-
-        // Check if TLS is enabled
         let use_tls = tls_acceptor.is_some();
 
-        // Perform TLS handshake if acceptor is provided
         let tls_stream = if let Some(ref acceptor) = tls_acceptor {
             match acceptor.accept(stream).await {
                 Ok(tls) => MaybeTlsStream::NativeTls(tls),
@@ -260,7 +199,6 @@ impl WsTransport {
             MaybeTlsStream::Plain(stream)
         };
 
-        // Perform WebSocket handshake
         let ws_stream = match accept_async_with_config(tls_stream, None).await {
             Ok(ws) => ws,
             Err(e) => {
@@ -286,63 +224,88 @@ impl WsTransport {
         self.peer_addr
     }
 
+    fn parse_url(url: &str) -> io::Result<(String, u16, bool)> {
+        let parsed_url = url::Url::parse(url)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse URL: {}", e)))?;
+
+        let host = parsed_url.host_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing host in URL"))?
+            .to_string();
+
+        let port = parsed_url.port_or_known_default()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing port in URL"))?;
+
+        let use_tls = parsed_url.scheme() == "wss";
+
+        Ok((host, port, use_tls))
+    }
+
+    async fn establish_tcp_connection(host: &str, port: u16) -> io::Result<TcpStream> {
+        TcpStream::connect((host, port))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))
+    }
+
+    async fn wrap_with_tls(tcp_stream: TcpStream, host: &str, ca_cert_path: &str) -> io::Result<MaybeTlsStream<TcpStream>> {
+        log::info!("Establishing TLS connection to {} (with root certificate verification)", host);
+
+        let mut builder = native_tls::TlsConnector::builder();
+        if Path::new(ca_cert_path).exists() {
+            let cert_pem = fs::read_to_string(ca_cert_path)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read root CA certificate: {}", e)))?;
+            let certificate = native_tls::Certificate::from_pem(cert_pem.as_bytes())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse root CA certificate: {}", e)))?;
+            builder.add_root_certificate(certificate);
+        }
+
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+
+        let tls_connector = builder.build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build TLS connector: {}", e)))?;
+
+        let tokio_tls_connector = TlsConnector::from(tls_connector);
+        let tls_stream = tokio_tls_connector.connect(host, tcp_stream)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {}", e)))?;
+
+        Ok(MaybeTlsStream::NativeTls(tls_stream))
+    }
+
+    async fn perform_websocket_handshake(url: &str, stream: MaybeTlsStream<TcpStream>) -> io::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let request = tokio_tungstenite::tungstenite::handshake::client::Request::from(
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to create request: {}", e)))?
+        );
+
+        tokio_tungstenite::client_async_with_config(request, stream, None)
+            .await
+            .map(|(ws, _response)| ws)
+            .map_err(|e| {
+                log::error!("WebSocket handshake failed: {}", e);
+                io::Error::new(io::ErrorKind::ConnectionRefused, format!("WebSocket handshake failed: {}", e))
+            })
+    }
+
     pub async fn connect(url: &str) -> io::Result<Self> {
         log::info!("Connecting to WebSocket server at {}", url);
 
-        let parsed_url = url::Url::parse(url)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse URL: {}", e)))?;
-        let host = parsed_url.host_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing host in URL"))?;
-        let port = parsed_url.port_or_known_default()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing port in URL"))?;
-        let use_tls = parsed_url.scheme() == "wss";
+        let (host, port, use_tls) = Self::parse_url(url)?;
 
-        let tcp_stream = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))?;
+        let tcp_stream = Self::establish_tcp_connection(&host, port).await?;
+
         let stream = if use_tls {
-            log::info!("Establishing TLS connection to {} (with root certificate verification)", host);
-            let mut builder = native_tls::TlsConnector::builder();
-            let cert_path = "certs/ca-cert.pem";
-
-            if Path::new(cert_path).exists() {
-                let cert_pem = fs::read_to_string(cert_path)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read root CA certificate: {}", e)))?;
-                let certificate = native_tls::Certificate::from_pem(cert_pem.as_bytes())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse root CA certificate: {}", e)))?;
-                builder.add_root_certificate(certificate);
-            }
-            builder.danger_accept_invalid_certs(true);
-            builder.danger_accept_invalid_hostnames(true);
-
-            let tls_connector = builder.build()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build TLS connector: {}", e)))?;
-
-            let tokio_tls_connector = TlsConnector::from(tls_connector);
-            let tls_stream = tokio_tls_connector.connect(host, tcp_stream)
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {}", e)))?;
-
-            MaybeTlsStream::NativeTls(tls_stream)
+            Self::wrap_with_tls(tcp_stream, &host, &Self::DEFAULT_CA_CERT_PATH).await?
         } else {
             MaybeTlsStream::Plain(tcp_stream)
         };
 
-        let request = tokio_tungstenite::tungstenite::handshake::client::Request::from(tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to create request: {}", e)))?);
-        let ws_stream = tokio_tungstenite::client_async_with_config(
-            request,
-            stream,
-            None
-        ).await
-        .map(|(ws, _response)| ws)
-        .map_err(|e| {
-            log::error!("WebSocket handshake failed: {}", e);
-            io::Error::new(io::ErrorKind::ConnectionRefused, format!("WebSocket handshake failed: {}", e))
-        })?;
+        let ws_stream = Self::perform_websocket_handshake(url, stream).await?;
 
-        let server_addr = format!("{}:{}", host, port).parse()
+        let server_addr = format!("{}:{}", host, port)
+            .parse()
             .unwrap_or_else(|_| "127.0.0.1:80".parse().unwrap());
+
         log::info!("Connected to WebSocket server at {}", url);
 
         Ok(Self { ws_stream, peer_addr: server_addr })
@@ -370,7 +333,6 @@ impl TransportTrait for WsTransport {
                 Some(Ok(ws_msg)) => {
                     match ws_msg {
                         WsMessage::Binary(bytes) => {
-                            // Deserialize Message from bytes
                             match bincode::deserialize::<Message>(&bytes) {
                                 Ok(msg) => return Some(Ok((msg, self.peer_addr))),
                                 Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
@@ -378,15 +340,12 @@ impl TransportTrait for WsTransport {
                         }
                         WsMessage::Close(_) => return None,
                         WsMessage::Ping(data) => {
-                            // Respond to ping with pong and continue
                             if let Err(e) = self.ws_stream.send(WsMessage::Pong(data)).await {
                                 return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                             }
-                            // Continue to next message
                             continue;
                         }
                         WsMessage::Pong(_) => {
-                            // Ignore pongs, continue to next message
                             continue;
                         }
                         WsMessage::Text(_) | WsMessage::Frame(_) => {
