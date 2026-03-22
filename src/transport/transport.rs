@@ -289,28 +289,29 @@ impl WsTransport {
     pub async fn connect(url: &str) -> io::Result<Self> {
         log::info!("Connecting to WebSocket server at {}", url);
 
-        // Parse URL and create custom connection with TLS bypass
         let parsed_url = url::Url::parse(url)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse URL: {}", e)))?;
-
         let host = parsed_url.host_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing host in URL"))?;
-
         let port = parsed_url.port_or_known_default()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing port in URL"))?;
-
         let use_tls = parsed_url.scheme() == "wss";
 
-        // Connect TCP stream
         let tcp_stream = TcpStream::connect((host, port))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))?;
-
-        // Wrap with TLS if needed, bypassing certificate verification
         let stream = if use_tls {
-            log::info!("Establishing TLS connection to {} (bypassing certificate verification)", host);
-
+            log::info!("Establishing TLS connection to {} (with root certificate verification)", host);
             let mut builder = native_tls::TlsConnector::builder();
+            let cert_path = "certs/ca-cert.pem";
+
+            if Path::new(cert_path).exists() {
+                let cert_pem = fs::read_to_string(cert_path)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read root CA certificate: {}", e)))?;
+                let certificate = native_tls::Certificate::from_pem(cert_pem.as_bytes())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse root CA certificate: {}", e)))?;
+                builder.add_root_certificate(certificate);
+            }
             builder.danger_accept_invalid_certs(true);
             builder.danger_accept_invalid_hostnames(true);
 
@@ -327,10 +328,8 @@ impl WsTransport {
             MaybeTlsStream::Plain(tcp_stream)
         };
 
-        // Create WebSocket stream using client handshake
         let request = tokio_tungstenite::tungstenite::handshake::client::Request::from(tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to create request: {}", e)))?);
-
         let ws_stream = tokio_tungstenite::client_async_with_config(
             request,
             stream,
@@ -342,10 +341,8 @@ impl WsTransport {
             io::Error::new(io::ErrorKind::ConnectionRefused, format!("WebSocket handshake failed: {}", e))
         })?;
 
-        // Extract peer address
         let server_addr = format!("{}:{}", host, port).parse()
             .unwrap_or_else(|_| "127.0.0.1:80".parse().unwrap());
-
         log::info!("Connected to WebSocket server at {}", url);
 
         Ok(Self { ws_stream, peer_addr: server_addr })
