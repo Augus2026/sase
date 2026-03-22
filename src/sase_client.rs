@@ -70,7 +70,7 @@ async fn transport_io_task<T>(
     client_id: u32,
     mut tun_rx: mpsc::Receiver<Vec<u8>>,
     transport_tx: mpsc::Sender<Vec<u8>>,
-)
+) -> Result<()>
 where
     T: TransportTrait<Error = std::io::Error>,
 {
@@ -92,7 +92,7 @@ where
                                 print_packet_info("[transport recv]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
                                     error!("Transport: Failed to send to TUN: {}", e);
-                                    break;
+                                    return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
                                 }
                             }
                             Ok(MessageType::KeepAlive) => {
@@ -113,7 +113,7 @@ where
                             }
                             Ok(MessageType::Disconnect) => {
                                 warn!("Server disconnected");
-                                break;
+                                return Err(anyhow::anyhow!("Server disconnected"));
                             }
                             _ => {
                                 info!("Transport: Unknown message type: {}", msg.message_type);
@@ -122,10 +122,11 @@ where
                     }
                     Some(Err(e)) => {
                         error!("Transport: Error receiving: {}", e);
-                        break;
+                        return Err(anyhow::anyhow!("Error receiving: {}", e));
                     }
                     None => {
-                        break;
+                        error!("Transport: Connection closed");
+                        return Err(anyhow::anyhow!("Connection closed"));
                     }
                 }
             }
@@ -137,12 +138,12 @@ where
                         let message = Message::data(data);
                         if let Err(e) = transport.send(message, server_addr).await {
                             error!("Transport: Failed to send to server: {}", e);
-                            break;
+                            return Err(anyhow::anyhow!("Failed to send to server: {}", e));
                         }
                     }
                     None => {
                         error!("Transport: Channel disconnected");
-                        break;
+                        return Err(anyhow::anyhow!("Channel disconnected"));
                     }
                 }
             }
@@ -156,7 +157,7 @@ where
                 let message = Message::keepalive(timestamp_bytes);
                 if let Err(e) = transport.send(message, server_addr).await {
                     error!("Keepalive: Failed to send: {}", e);
-                    break;
+                    return Err(anyhow::anyhow!("Keepalive failed: {}", e));
                 }
             }
         }
@@ -243,15 +244,33 @@ pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transp
     );
 
     tokio::select! {
-        _ = tun_handle => {},
-        _ = transport_handle => {},
+        result = tun_handle => {
+            match result {
+                Ok(()) => info!("TUN task completed successfully"),
+                Err(e) => {
+                    error!("TUN task panicked: {}", e);
+                    return Err(anyhow::anyhow!("TUN task panicked: {}", e));
+                }
+            }
+        }
+        result = transport_handle => {
+            match result {
+                Ok(Ok(())) => info!("Transport task completed successfully"),
+                Ok(Err(e)) => {
+                    error!("Transport task failed: {}", e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    error!("Transport task panicked: {}", e);
+                    return Err(anyhow::anyhow!("Transport task panicked: {}", e));
+                }
+            }
+        }
     }
     Ok(())
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
-    info!("Connecting to server to get TUN configuration...");
-
     match config.transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
