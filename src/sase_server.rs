@@ -61,7 +61,6 @@ async fn handle_handshake(
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     client_id: u32,
-    handshake: Handshake,
 ) {
     let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
     let tun_config = build_tun_config(client_id, &virtual_ip.to_string());
@@ -154,7 +153,7 @@ async fn udp_transport_io_task(
                             Some(MessageType::Handshake(handshake)) => {
                                 let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
                                 let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id, handshake).await;
+                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -248,7 +247,7 @@ async fn handle_tcp_connection(
                     Some(Ok((msg, src_addr))) => {
                         match msg.msg {
                             Some(MessageType::Handshake(handshake)) => {
-                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id, handshake).await;
+                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -367,7 +366,7 @@ async fn handle_ws_connection(
                     Some(Ok((msg, src_addr))) => {
                         match msg.msg {
                             Some(MessageType::Handshake(handshake)) => {
-                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id, handshake).await;
+                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;

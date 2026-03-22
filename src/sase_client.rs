@@ -11,7 +11,7 @@ use tokio::time::{interval, sleep};
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     server_addr: std::net::SocketAddr,
-) -> Result<(u32, TunConfig)> {
+) -> Result<TunConfig> {
     info!("Handshake with server at {}", server_addr);
     let handshake_message = Message::handshake(Handshake {
         session_id: String::new(),
@@ -29,19 +29,16 @@ async fn handshake_async(
                 Some(Ok((msg, _addr))) => {
                     match msg.msg {
                         Some(MessageType::Handshake(handshake)) => {
-                            let client_id = 1; // Default client ID for now
-                            info!("Connected! Client ID: {}", client_id);
 
                             if let Some(tun_config) = handshake.tun_config {
-                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
-                                        tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-                                return Ok((client_id, TunConfig {
+                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}", tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+                                return Ok(TunConfig {
                                     name: tun_config.name,
                                     address: tun_config.address,
                                     netmask: tun_config.netmask,
                                     dns: tun_config.dns,
                                     mtu: tun_config.mtu,
-                                }));
+                                });
                             } else {
                                 return Err(anyhow::anyhow!("No TUN config in handshake response"));
                             }
@@ -140,7 +137,7 @@ where
     }
 }
 
-pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: TcpTransport, client_id: u32) -> Result<()> {
+pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: TcpTransport) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
@@ -187,7 +184,7 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
-pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: UdpTransport, client_id: u32) -> Result<()> {
+pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: UdpTransport) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
@@ -234,7 +231,7 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
-pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transport: WsTransport, client_id: u32) -> Result<()> {
+pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transport: WsTransport) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
@@ -289,23 +286,23 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             info!("Using TCP transport");
 
             let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
-            let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
+            let tun_config= handshake_async(&mut transport, config.server_addr).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
 
-            run_tcp_client(config, tun_device, transport, client_id).await?;
+            run_tcp_client(config, tun_device, transport).await?;
         }
         "udp" => {
             info!("Using UDP transport");
 
             let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
-            let (client_id, tun_config) = handshake_async(&mut transport, config.server_addr).await?;
+            let tun_config = handshake_async(&mut transport, config.server_addr).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
 
-            run_udp_client(config, tun_device, transport, client_id).await?;
+            run_udp_client(config, tun_device, transport).await?;
         }
         "ws" => {
             info!("Using WebSocket transport");
@@ -313,12 +310,12 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             let ws_url = format!("ws://{}", config.server_addr);
             let mut transport = WsTransport::connect(&ws_url, &config.ca_cert_path).await?;
             let server_addr = transport.server_addr();
-            let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
+            let tun_config = handshake_async(&mut transport, server_addr).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
 
-            run_ws_client(config, tun_device, transport, client_id).await?;
+            run_ws_client(config, tun_device, transport).await?;
         }
         "wss" => {
             info!("Using WebSocket(Secure) transport");
@@ -326,12 +323,12 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             let wss_url = format!("wss://{}", config.server_addr);
             let mut transport = WsTransport::connect(&wss_url, &config.ca_cert_path).await?;
             let server_addr = transport.server_addr();
-            let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
+            let tun_config = handshake_async(&mut transport, server_addr).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
 
-            run_ws_client(config, tun_device, transport, client_id).await?;
+            run_ws_client(config, tun_device, transport).await?;
         }
         _ => {
             error!("Unknown transport type: {}", config.transport_type);
