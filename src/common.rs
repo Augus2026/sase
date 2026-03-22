@@ -135,10 +135,8 @@ pub async fn tun_io_task(
     mut tun: tun2::AsyncDevice,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut transport_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-) {
+) -> anyhow::Result<()> {
     let mut tun_buf = vec![0u8; TUN_MTU];
-    info!("TUN I/O task started");
-
     loop {
         tokio::select! {
             result = transport_rx.recv() => {
@@ -146,12 +144,11 @@ pub async fn tun_io_task(
                     Some(data) => {
                         print_packet_info("[tun write]", &data);
                         if let Err(e) = tun.write_all(&data).await {
-                            error!("TUN I/O: Failed to write to TUN: {}", e);
+                            return Err(anyhow::anyhow!("Failed to write to TUN: {}", e));
                         }
                     }
                     None => {
-                        error!("TUN I/O: Channel disconnected");
-                        break;
+                        return Err(anyhow::anyhow!("Channel disconnected"));
                     }
                 }
             }
@@ -162,13 +159,11 @@ pub async fn tun_io_task(
                         let data = tun_buf[..n].to_vec();
                         print_packet_info("[tun read]", &data);
                         if let Err(e) = tun_tx.send(data).await {
-                            error!("TUN I/O: Failed to send to transport: {}", e);
-                            break;
+                            return Err(anyhow::anyhow!("Failed to send to transport: {}", e));
                         }
                     }
                     Err(e) => {
-                        error!("TUN I/O: Error reading from TUN: {}", e);
-                        break;
+                        return Err(anyhow::anyhow!("Error reading from TUN: {}", e));
                     }
                 }
             }

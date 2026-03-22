@@ -24,30 +24,26 @@ async fn handshake_async(
         result = transport.next() => {
             match result {
                 Some(Ok((msg, addr))) => {
-                    if addr == server_addr {
-                        match MessageType::try_from(msg.message_type) {
-                            Ok(MessageType::Handshake) => {
-                                if msg.data.len() >= 4 {
-                                    let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                                    info!("Connected! Client ID: {}", client_id);
+                    match MessageType::try_from(msg.message_type) {
+                        Ok(MessageType::Handshake) => {
+                            if msg.data.len() >= 4 {
+                                let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                                info!("Connected! Client ID: {}", client_id);
 
-                                    if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
-                                        info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
-                                              tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-                                        return Ok((client_id, tun_config));
-                                    } else {
-                                        return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
-                                    }
+                                if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
+                                    info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
+                                            tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+                                    return Ok((client_id, tun_config));
                                 } else {
-                                    return Err(anyhow::anyhow!("Handshake response too short: expected at least 4 bytes"));
+                                    return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
                                 }
-                            }
-                            _ => {
-                                return Err(anyhow::anyhow!("Invalid handshake response: unexpected message type: {}", msg.message_type));
+                            } else {
+                                return Err(anyhow::anyhow!("Handshake response too short: expected at least 4 bytes"));
                             }
                         }
-                    } else {
-                        return Err(anyhow::anyhow!("Handshake response from unexpected address: {}", addr));
+                        _ => {
+                            return Err(anyhow::anyhow!("Invalid handshake response: unexpected message type: {}", msg.message_type));
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -67,31 +63,22 @@ async fn handshake_async(
 async fn transport_io_task<T>(
     mut transport: T,
     server_addr: std::net::SocketAddr,
-    client_id: u32,
     mut tun_rx: mpsc::Receiver<Vec<u8>>,
     transport_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<()>
+) -> anyhow::Result<()>
 where
     T: TransportTrait<Error = std::io::Error>,
 {
     let mut keepalive_interval = interval(Duration::from_millis(3000));
-    info!("Transport I/O task started for client {}", client_id);
-
     loop {
         tokio::select! {
             result = transport.next() => {
                 match result {
-                    Some(Ok((msg, src_addr))) => {
-                        if src_addr != server_addr {
-                            info!("Transport: Received packet from unexpected address: {}", src_addr);
-                            continue;
-                        }
-
+                    Some(Ok((msg, addr))) => {
                         match MessageType::try_from(msg.message_type) {
                             Ok(MessageType::Data) => {
                                 print_packet_info("[transport recv]", &msg.data);
                                 if let Err(e) = transport_tx.send(msg.data).await {
-                                    error!("Transport: Failed to send to TUN: {}", e);
                                     return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
                                 }
                             }
@@ -112,7 +99,6 @@ where
                                 }
                             }
                             Ok(MessageType::Disconnect) => {
-                                warn!("Server disconnected");
                                 return Err(anyhow::anyhow!("Server disconnected"));
                             }
                             _ => {
@@ -121,11 +107,9 @@ where
                         }
                     }
                     Some(Err(e)) => {
-                        error!("Transport: Error receiving: {}", e);
                         return Err(anyhow::anyhow!("Error receiving: {}", e));
                     }
                     None => {
-                        error!("Transport: Connection closed");
                         return Err(anyhow::anyhow!("Connection closed"));
                     }
                 }
@@ -137,12 +121,10 @@ where
                         print_packet_info("[transport send]", &data);
                         let message = Message::data(data);
                         if let Err(e) = transport.send(message, server_addr).await {
-                            error!("Transport: Failed to send to server: {}", e);
                             return Err(anyhow::anyhow!("Failed to send to server: {}", e));
                         }
                     }
                     None => {
-                        error!("Transport: Channel disconnected");
                         return Err(anyhow::anyhow!("Channel disconnected"));
                     }
                 }
@@ -156,7 +138,6 @@ where
                 let timestamp_bytes = timestamp.to_be_bytes().to_vec();
                 let message = Message::keepalive(timestamp_bytes);
                 if let Err(e) = transport.send(message, server_addr).await {
-                    error!("Keepalive: Failed to send: {}", e);
                     return Err(anyhow::anyhow!("Keepalive failed: {}", e));
                 }
             }
@@ -179,15 +160,34 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
         transport_io_task(
             transport,
             config.server_addr,
-            client_id,
             tun_rx,
             transport_tx,
         )
     );
 
     tokio::select! {
-        _ = tun_handle => {},
-        _ = transport_handle => {},
+        result = tun_handle => {
+            match result {
+                Ok(Ok(())) => info!("TUN task completed successfully"),
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("TUN task failed: {}", e));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("TUN task panicked: {}", e));
+                }
+            }
+        }
+        result = transport_handle => {
+            match result {
+                Ok(Ok(())) => info!("Transport task completed successfully"),
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("Transport task failed: {}", e));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Transport task panicked: {}", e));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -207,15 +207,34 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
         transport_io_task(
             transport,
             config.server_addr,
-            client_id,
             tun_rx,
             transport_tx,
         )
     );
 
     tokio::select! {
-        _ = tun_handle => {},
-        _ = transport_handle => {},
+        result = tun_handle => {
+            match result {
+                Ok(Ok(())) => info!("TUN task completed successfully"),
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("TUN task failed: {}", e));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("TUN task panicked: {}", e));
+                }
+            }
+        }
+        result = transport_handle => {
+            match result {
+                Ok(Ok(())) => info!("Transport task completed successfully"),
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("Transport task failed: {}", e));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Transport task panicked: {}", e));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -237,7 +256,6 @@ pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transp
         transport_io_task(
             transport,
             server_addr,
-            client_id,
             tun_rx,
             transport_tx,
         )
@@ -246,9 +264,11 @@ pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transp
     tokio::select! {
         result = tun_handle => {
             match result {
-                Ok(()) => info!("TUN task completed successfully"),
+                Ok(Ok(())) => info!("TUN task completed successfully"),
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("TUN task failed: {}", e));
+                }
                 Err(e) => {
-                    error!("TUN task panicked: {}", e);
                     return Err(anyhow::anyhow!("TUN task panicked: {}", e));
                 }
             }
@@ -257,11 +277,9 @@ pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transp
             match result {
                 Ok(Ok(())) => info!("Transport task completed successfully"),
                 Ok(Err(e)) => {
-                    error!("Transport task failed: {}", e);
-                    return Err(e);
+                    return Err(anyhow::anyhow!("Transport task failed: {}", e));
                 }
                 Err(e) => {
-                    error!("Transport task panicked: {}", e);
                     return Err(anyhow::anyhow!("Transport task panicked: {}", e));
                 }
             }
