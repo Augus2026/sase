@@ -180,13 +180,6 @@ impl WsTransport {
         let (stream, addr) = listener.accept().await?;
         let peer_addr = addr;
 
-        if tls_acceptor.is_some() {
-            log::info!("Attempting WSS (WebSocket Secure) connection from {}", addr);
-        } else {
-            log::info!("Attempting WebSocket connection from {}", addr);
-        }
-        let use_tls = tls_acceptor.is_some();
-
         let tls_stream = if let Some(ref acceptor) = tls_acceptor {
             match acceptor.accept(stream).await {
                 Ok(tls) => MaybeTlsStream::NativeTls(tls),
@@ -207,7 +200,7 @@ impl WsTransport {
             }
         };
 
-        if use_tls {
+        if tls_acceptor.is_some() {
             log::info!("WSS connection established from {}", addr);
         } else {
             log::info!("WebSocket connection established from {}", addr);
@@ -224,7 +217,7 @@ impl WsTransport {
         self.peer_addr
     }
 
-    fn parse_url(url: &str) -> io::Result<(String, u16, bool)> {
+    fn parse_url(url: &str) -> io::Result<(String, u16, String,)> {
         let parsed_url = url::Url::parse(url)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse URL: {}", e)))?;
 
@@ -235,9 +228,9 @@ impl WsTransport {
         let port = parsed_url.port_or_known_default()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing port in URL"))?;
 
-        let use_tls = parsed_url.scheme() == "wss";
+        let scheme = parsed_url.scheme().to_string();
 
-        Ok((host, port, use_tls))
+        Ok((host, port, scheme))
     }
 
     async fn wrap_with_tls(tcp_stream: TcpStream, host: &str, ca_cert_path: &str) -> io::Result<MaybeTlsStream<TcpStream>> {
@@ -284,15 +277,13 @@ impl WsTransport {
     pub async fn connect(url: &str) -> io::Result<Self> {
         log::info!("Connecting to WebSocket server at {}", url);
 
-        let (host, port, use_tls) = Self::parse_url(url)?;
-
-        let host_str = host.as_str();
-        let tcp_stream = TcpStream::connect((host_str, port))
+        let (host, port, scheme) = Self::parse_url(url)?;
+        let tcp_stream = TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("Failed to connect to {}: {}", host, e)))?;
 
-        let stream = if use_tls {
-            Self::wrap_with_tls(tcp_stream, host_str, &Self::DEFAULT_CA_CERT_PATH).await?
+        let stream = if scheme == "wss" {
+            Self::wrap_with_tls(tcp_stream, host.as_str(), &Self::DEFAULT_CA_CERT_PATH).await?
         } else {
             MaybeTlsStream::Plain(tcp_stream)
         };
