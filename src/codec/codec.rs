@@ -1,17 +1,37 @@
-//! Custom codec for encoding and decoding Message
+//! Custom codec for encoding and decoding protobuf Messages
 
-use crate::codec::message::Message;
+use prost::Message as _;
 use bytes::{Buf, BufMut, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
+include!(concat!(env!("OUT_DIR"), "/sase.rs"));
 
-/// Header size constant (5 bytes: message_type(1) + data_len(4))
-const HEADER_SIZE: usize = 5;
+// Convenience functions for creating protobuf messages
+impl Message {
+    pub fn handshake(handshake: Handshake) -> Self {
+        Self { msg: Some(message::Msg::Handshake(handshake)) }
+    }
+
+    pub fn data(data: Data) -> Self {
+        Self { msg: Some(message::Msg::Data(data)) }
+    }
+
+    pub fn keepalive(keepalive: KeepAlive) -> Self {
+        Self { msg: Some(message::Msg::Keepalive(keepalive)) }
+    }
+
+    pub fn disconnect(disconnect: Disconnect) -> Self {
+        Self { msg: Some(message::Msg::Disconnect(disconnect)) }
+    }
+}
+
+/// Header size constant (4 bytes for length prefix)
+const HEADER_SIZE: usize = 4;
 
 /// Maximum allowed frame size (1MB by default)
 const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 
-/// Custom codec for encoding and decoding Message
+/// Custom codec for encoding and decoding protobuf Messages
 #[derive(Debug)]
 pub struct ByteCodec {
     state: DecodeState,
@@ -42,9 +62,9 @@ impl ByteCodec {
         }
     }
 
-    /// Calculate the total frame size for a given message
+    /// Calculate the total frame size for a given protobuf message
     pub fn calculate_frame_size(message: &Message) -> usize {
-        HEADER_SIZE + message.data.len()
+        HEADER_SIZE + message.encoded_len()
     }
 }
 
@@ -55,7 +75,6 @@ pub enum DecodeState {
     Head,
     /// Reading frame body
     Body {
-        message_type: u8,
         data_len: usize,
     },
 }
@@ -71,7 +90,8 @@ impl Encoder<Message> for ByteCodec {
     type Error = io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), io::Error> {
-        let required = Self::calculate_frame_size(&item);
+        let body = item.encode_to_vec();
+        let required = HEADER_SIZE + body.len();
 
         // Validate frame size
         if required > self.max_frame_size {
@@ -85,11 +105,10 @@ impl Encoder<Message> for ByteCodec {
         dst.reserve(required);
 
         // Encode frame header (little-endian for network compatibility)
-        dst.put_u8(item.message_type);
-        dst.put_u32_le(item.data.len() as u32);
+        dst.put_u32_le(body.len() as u32);
 
-        // Encode frame body
-        dst.extend_from_slice(&item.data);
+        // Encode frame body (protobuf data)
+        dst.extend_from_slice(&body);
 
         Ok(())
     }
@@ -109,7 +128,6 @@ impl Decoder for ByteCodec {
                 }
 
                 // Parse header
-                let message_type = src.get_u8();
                 let data_len = src.get_u32_le() as usize;
 
                 // Validate data length
@@ -121,18 +139,12 @@ impl Decoder for ByteCodec {
                 }
 
                 // Transition to body state
-                self.state = DecodeState::Body {
-                    message_type,
-                    data_len,
-                };
+                self.state = DecodeState::Body { data_len };
 
                 // Continue decoding body
                 self.decode(src)
             }
-            DecodeState::Body {
-                message_type,
-                data_len,
-            } => {
+            DecodeState::Body { data_len } => {
                 // Check if we have enough data for body
                 if src.len() < data_len {
                     return Ok(None);
@@ -144,11 +156,10 @@ impl Decoder for ByteCodec {
                 // Reset state for next frame
                 self.state = DecodeState::Head;
 
-                // Return complete message
-                Ok(Some(Message {
-                    message_type,
-                    data,
-                }))
+                // Decode protobuf message
+                Message::decode(&*data)
+                    .map(Some)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             }
         }
     }

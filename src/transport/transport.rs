@@ -1,4 +1,5 @@
 use crate::codec::{Message, ByteCodec};
+use prost::Message as _;
 use std::io;
 use std::net::SocketAddr;
 use std::fs;
@@ -14,7 +15,6 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_native_tls::TlsAcceptor;
 use tokio_native_tls::TlsConnector;
 use native_tls::Identity;
-use bincode;
 
 #[allow(async_fn_in_trait)]
 pub trait TransportTrait {
@@ -261,9 +261,7 @@ impl TransportTrait for WsTransport {
     type Error = io::Error;
 
     async fn send(&mut self, msg: Message, _addr: SocketAddr) -> Result<(), Self::Error> {
-        let bytes = bincode::serialize(&msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+        let bytes = msg.encode_to_vec();
         let ws_msg = WsMessage::Binary(bytes);
         self.ws_stream.send(ws_msg).await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
     }
@@ -272,7 +270,7 @@ impl TransportTrait for WsTransport {
         loop {
             match self.ws_stream.next().await {
                 Some(Ok(WsMessage::Binary(bytes))) => {
-                    return bincode::deserialize::<Message>(&bytes)
+                    return Message::decode(&bytes[..])
                         .map(|msg| Ok((msg, self.peer_addr)))
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
                         .ok();

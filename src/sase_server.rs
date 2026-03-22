@@ -1,7 +1,7 @@
 use crate::common::{ServerConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
-use crate::codec::{Message, MessageType};
-use crate::tun_config::{TunConfig, build_tun_config, serialize_tun_config};
+use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive, TunConfig};
+use crate::tun_config::build_tun_config;
 use anyhow::Result;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,7 +15,6 @@ use tun2::{create_as_async, Configuration};
 struct Client {
     addr: SocketAddr,
     virtual_ip: Ipv4Addr,
-    tun_config: TunConfig,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
@@ -48,9 +47,9 @@ async fn handle_data(
 async fn handle_keepalive(
     src_addr: SocketAddr,
     transport: &mut impl TransportTrait<Error = std::io::Error>,
-    msg_data: Vec<u8>,
+    timestamp: i64,
 ) {
-    let response = Message::keepalive(msg_data);
+    let response = Message::keepalive(KeepAlive { timestamp });
     if let Err(e) = transport.send(response, src_addr).await {
         warn!("Failed to send keepalive response to {}: {}", src_addr, e);
     }
@@ -62,22 +61,32 @@ async fn handle_handshake(
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     client_id: u32,
+    handshake: Handshake,
 ) {
     let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
     let tun_config = build_tun_config(client_id, &virtual_ip.to_string());
-    let mut response_data = client_id.to_be_bytes().to_vec();
-    response_data.extend_from_slice(&serialize_tun_config(&tun_config));
-    let message = Message::handshake(response_data);
+
+    let proto_tun_config = TunConfig {
+        name: tun_config.name.clone(),
+        address: tun_config.address.clone(),
+        netmask: tun_config.netmask.clone(),
+        dns: tun_config.dns.clone(),
+        mtu: tun_config.mtu,
+    };
+
+    let message = Message::handshake(Handshake {
+        session_id: format!("{}", client_id),
+        tun_config: Some(proto_tun_config),
+    });
 
     if let Err(e) = transport.send(message, src_addr).await {
         error!("Failed to send handshake to {}: {}", src_addr, e);
         return;
     }
-    
+
     let client = Client {
         addr: src_addr,
         virtual_ip,
-        tun_config,
         tx: client_tx,
     };
 
@@ -122,7 +131,7 @@ async fn send_to_client(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     client: &Client,
 ) {
-    let message = Message::data(data.to_vec());
+    let message = Message::data(Data { payload: data.to_vec() });
     if let Err(e) = transport.send(message, client.addr).await {
         warn!("Failed to send to {}: {}", client.addr, e);
     }
@@ -141,23 +150,24 @@ async fn udp_transport_io_task(
             result = transport.next() => {
                 match result {
                     Some(Ok((msg, src_addr))) => {
-                        match MessageType::try_from(msg.message_type) {
-                            Ok(MessageType::Handshake) => {
+                        match msg.msg {
+                            Some(MessageType::Handshake(handshake)) => {
                                 let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
                                 let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id).await;
+                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id, handshake).await;
                             }
-                            Ok(MessageType::Data) => {
-                                handle_data(&msg.data, &transport_tx).await;
+                            Some(MessageType::Data(data)) => {
+                                handle_data(&data.payload, &transport_tx).await;
                             }
-                            Ok(MessageType::KeepAlive) => {
-                                handle_keepalive(src_addr, &mut transport, msg.data).await;
+                            Some(MessageType::Keepalive(keepalive)) => {
+                                handle_keepalive(src_addr, &mut transport, keepalive.timestamp).await;
                             }
-                            Ok(MessageType::Disconnect) => {
+                            Some(MessageType::Disconnect(disconnect)) => {
                                 handle_disconnect(src_addr, &clients).await;
+                                info!("Client {} disconnected: {}", src_addr, disconnect.reason);
                             }
                             _ => {
-                                info!("Unknown message type from {}: {}", src_addr, msg.message_type);
+                                info!("Unknown message type from {}", src_addr);
                             }
                         }
                     }
@@ -236,21 +246,22 @@ async fn handle_tcp_connection(
             result = tcp_transport.next() => {
                 match result {
                     Some(Ok((msg, src_addr))) => {
-                        match MessageType::try_from(msg.message_type) {
-                            Ok(MessageType::Handshake) => {
-                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id).await;
+                        match msg.msg {
+                            Some(MessageType::Handshake(handshake)) => {
+                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id, handshake).await;
                             }
-                            Ok(MessageType::Data) => {
-                                handle_data(&msg.data, &transport_tx).await;
+                            Some(MessageType::Data(data)) => {
+                                handle_data(&data.payload, &transport_tx).await;
                             }
-                            Ok(MessageType::KeepAlive) => {
-                                handle_keepalive(src_addr, &mut tcp_transport, msg.data).await;
+                            Some(MessageType::Keepalive(keepalive)) => {
+                                handle_keepalive(src_addr, &mut tcp_transport, keepalive.timestamp).await;
                             }
-                            Ok(MessageType::Disconnect) => {
+                            Some(MessageType::Disconnect(disconnect)) => {
                                 handle_disconnect(src_addr, &clients).await;
+                                info!("Client {} disconnected: {}", src_addr, disconnect.reason);
                             }
                             _ => {
-                                warn!("Unknown message type: from {}: {}", src_addr, msg.message_type);
+                                warn!("Unknown message type from {}", src_addr);
                             }
                         }
                     }
@@ -268,7 +279,7 @@ async fn handle_tcp_connection(
             result = client_rx.recv() => {
                 match result {
                     Some(data) => {
-                        let message = Message::data(data);
+                        let message = Message::data(Data { payload: data });
                         if let Err(e) = tcp_transport.send(message, peer_addr).await {
                             warn!("Failed to send data to {}: {}", peer_addr, e);
                             break;
@@ -354,21 +365,22 @@ async fn handle_ws_connection(
             result = ws_transport.next() => {
                 match result {
                     Some(Ok((msg, src_addr))) => {
-                        match MessageType::try_from(msg.message_type) {
-                            Ok(MessageType::Handshake) => {
-                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id).await;
+                        match msg.msg {
+                            Some(MessageType::Handshake(handshake)) => {
+                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id, handshake).await;
                             }
-                            Ok(MessageType::Data) => {
-                                handle_data(&msg.data, &transport_tx).await;
+                            Some(MessageType::Data(data)) => {
+                                handle_data(&data.payload, &transport_tx).await;
                             }
-                            Ok(MessageType::KeepAlive) => {
-                                handle_keepalive(src_addr, &mut ws_transport, msg.data).await;
+                            Some(MessageType::Keepalive(keepalive)) => {
+                                handle_keepalive(src_addr, &mut ws_transport, keepalive.timestamp).await;
                             }
-                            Ok(MessageType::Disconnect) => {
+                            Some(MessageType::Disconnect(disconnect)) => {
                                 handle_disconnect(src_addr, &clients).await;
+                                info!("Client {} disconnected: {}", src_addr, disconnect.reason);
                             }
                             _ => {
-                                warn!("Unknown message type from {}: {}", src_addr, msg.message_type);
+                                warn!("Unknown message type from {}", src_addr);
                             }
                         }
                     }
@@ -386,7 +398,7 @@ async fn handle_ws_connection(
             result = client_rx.recv() => {
                 match result {
                     Some(data) => {
-                        let message = Message::data(data);
+                        let message = Message::data(Data { payload: data });
                         if let Err(e) = ws_transport.send(message, peer_addr).await {
                             warn!("Failed to send data to WS client {}: {}", peer_addr, e);
                             break;

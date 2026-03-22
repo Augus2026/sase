@@ -1,7 +1,7 @@
 use crate::common::{ClientConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
-use crate::codec::{Message, MessageType};
-use crate::tun_config::{TunConfig, deserialize_tun_config, create_tun_device};
+use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive};
+use crate::tun_config::{TunConfig, create_tun_device};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::time::Duration;
@@ -13,7 +13,10 @@ async fn handshake_async(
     server_addr: std::net::SocketAddr,
 ) -> Result<(u32, TunConfig)> {
     info!("Handshake with server at {}", server_addr);
-    let handshake_message = Message::handshake(vec![]);
+    let handshake_message = Message::handshake(Handshake {
+        session_id: String::new(),
+        tun_config: None,
+    });
 
     transport.send(handshake_message, server_addr).await?;
 
@@ -24,25 +27,27 @@ async fn handshake_async(
         result = transport.next() => {
             match result {
                 Some(Ok((msg, _addr))) => {
-                    match MessageType::try_from(msg.message_type) {
-                        Ok(MessageType::Handshake) => {
-                            if msg.data.len() >= 4 {
-                                let client_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                                info!("Connected! Client ID: {}", client_id);
+                    match msg.msg {
+                        Some(MessageType::Handshake(handshake)) => {
+                            let client_id = 1; // Default client ID for now
+                            info!("Connected! Client ID: {}", client_id);
 
-                                if let Some(tun_config) = deserialize_tun_config(&msg.data[4..]) {
-                                    info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
-                                            tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-                                    return Ok((client_id, tun_config));
-                                } else {
-                                    return Err(anyhow::anyhow!("Invalid TUN config in handshake response"));
-                                }
+                            if let Some(tun_config) = handshake.tun_config {
+                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
+                                        tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+                                return Ok((client_id, TunConfig {
+                                    name: tun_config.name,
+                                    address: tun_config.address,
+                                    netmask: tun_config.netmask,
+                                    dns: tun_config.dns,
+                                    mtu: tun_config.mtu,
+                                }));
                             } else {
-                                return Err(anyhow::anyhow!("Handshake response too short: expected at least 4 bytes"));
+                                return Err(anyhow::anyhow!("No TUN config in handshake response"));
                             }
                         }
                         _ => {
-                            return Err(anyhow::anyhow!("Invalid handshake response: unexpected message type: {}", msg.message_type));
+                            return Err(anyhow::anyhow!("Invalid handshake response: unexpected message type"));
                         }
                     }
                 }
@@ -75,33 +80,26 @@ where
             result = transport.next() => {
                 match result {
                     Some(Ok((msg, _addr))) => {
-                        match MessageType::try_from(msg.message_type) {
-                            Ok(MessageType::Data) => {
-                                if let Err(e) = transport_tx.send(msg.data).await {
+                        match msg.msg {
+                            Some(MessageType::Data(data)) => {
+                                if let Err(e) = transport_tx.send(data.payload).await {
                                     return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
                                 }
                             }
-                            Ok(MessageType::KeepAlive) => {
-                                if msg.data.len() >= 8 {
-                                    let sent_timestamp = u64::from_be_bytes([
-                                        msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                                        msg.data[4], msg.data[5], msg.data[6], msg.data[7],
-                                    ]);
-                                    let received_timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis() as u64;
-                                    let latency_ms = received_timestamp - sent_timestamp;
-                                    info!("Keepalive received from server, latency: {}ms", latency_ms);
-                                } else {
-                                    info!("Keepalive received from server");
-                                }
+                            Some(MessageType::Keepalive(keepalive)) => {
+                                let sent_timestamp = keepalive.timestamp;
+                                let received_timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                let latency_ms = received_timestamp - (sent_timestamp as u64);
+                                info!("Keepalive received from server, latency: {}ms", latency_ms);
                             }
-                            Ok(MessageType::Disconnect) => {
-                                return Err(anyhow::anyhow!("Server disconnected"));
+                            Some(MessageType::Disconnect(disconnect)) => {
+                                return Err(anyhow::anyhow!("Server disconnected: {}", disconnect.reason));
                             }
                             _ => {
-                                info!("Transport: Unknown message type: {}", msg.message_type);
+                                info!("Transport: Unknown message type");
                             }
                         }
                     }
@@ -117,7 +115,7 @@ where
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
-                        let message = Message::data(data);
+                        let message = Message::data(Data { payload: data });
                         if let Err(e) = transport.send(message, server_addr).await {
                             return Err(anyhow::anyhow!("Failed to send to server: {}", e));
                         }
@@ -132,9 +130,8 @@ where
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_millis() as u64;
-                let timestamp_bytes = timestamp.to_be_bytes().to_vec();
-                let message = Message::keepalive(timestamp_bytes);
+                    .as_millis() as i64;
+                let message = Message::keepalive(KeepAlive { timestamp });
                 if let Err(e) = transport.send(message, server_addr).await {
                     return Err(anyhow::anyhow!("Keepalive failed: {}", e));
                 }
