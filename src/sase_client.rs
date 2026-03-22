@@ -282,10 +282,23 @@ pub async fn run_client(config: ClientConfig, transport_type: String) -> Result<
             run_udp_client(config, tun_device, transport, client_id).await?;
         }
         "ws" => {
+            info!("Using WebSocket transport");
+
+            let ws_url = format!("ws://{}", config.server_addr);
+            let mut transport = WsTransport::connect(&ws_url).await?;
+            let server_addr = transport.server_addr();
+            let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
+
+            info!("Creating TUN device with server config: {}", tun_config.name);
+            let tun_device = create_tun_device(&tun_config)?;
+
+            run_ws_client(config, tun_device, transport, client_id).await?;
+        }
+        "wss" => {
             info!("Using WebSocket(Secure) transport");
 
-            let ws_url = format!("wss://{}", config.server_addr);
-            let mut transport = WsTransport::connect(&ws_url).await?;
+            let wss_url = format!("wss://{}", config.server_addr);
+            let mut transport = WsTransport::connect(&wss_url).await?;
             let server_addr = transport.server_addr();
             let (client_id, tun_config) = handshake_async(&mut transport, server_addr).await?;
 

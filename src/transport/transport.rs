@@ -230,19 +230,7 @@ impl WsTransport {
         Ok(MaybeTlsStream::NativeTls(tls_stream))
     }
 
-    async fn perform_websocket_handshake(url: &str, stream: MaybeTlsStream<TcpStream>) -> io::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        tokio_tungstenite::client_async_with_config(url, stream, None)
-            .await
-            .map(|(ws, _)| ws)
-            .map_err(|e| {
-                log::error!("WebSocket handshake failed: {}", e);
-                io::Error::new(io::ErrorKind::ConnectionRefused, format!("WebSocket handshake failed: {}", e))
-            })
-    }
-
     pub async fn connect(url: &str) -> io::Result<Self> {
-        log::info!("Connecting to WebSocket server at {}", url);
-
         let (host, port, use_tls) = Self::parse_url(url)?;
 
         let tcp_stream = TcpStream::connect((&*host, port))
@@ -255,7 +243,14 @@ impl WsTransport {
             MaybeTlsStream::Plain(tcp_stream)
         };
 
-        let ws_stream = Self::perform_websocket_handshake(url, stream).await?;
+        let ws_stream = tokio_tungstenite::client_async_with_config(url, stream, None)
+            .await
+            .map(|(ws, _)| ws)
+            .map_err(|e| {
+                log::error!("WebSocket handshake failed: {}", e);
+                io::Error::new(io::ErrorKind::ConnectionRefused, format!("WebSocket handshake failed: {}", e))
+            })?;
+
         let server_addr = format!("{}:{}", host, port)
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:80".parse().unwrap());
