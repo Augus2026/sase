@@ -41,7 +41,8 @@ async fn handshake_async(
                         Some(MessageType::Handshake(handshake)) => {
                             if let Some(tun_config) = handshake.tun_config {
                                 info!("Received TUN config: name={}, address={}, netmask={}, mtu={}", tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-                                if !is_reconnect {
+                                if handshake.session_id != config.session_id {
+                                    info!("Session ID changed: {} -> {}", config.session_id, handshake.session_id);
                                     config.session_id = handshake.session_id.clone();
                                     config.save_to_file(CONFIG_FILE)?;
                                 }
