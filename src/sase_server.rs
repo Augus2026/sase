@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
 use nanoid;
+use lazy_static::lazy_static;
 
 #[derive(Clone)]
 struct Client {
@@ -17,9 +19,14 @@ struct Client {
     addr: SocketAddr,
     virtual_ip: Ipv4Addr,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tun_config: TunConfig,
+    last_seen: SystemTime,
 }
 
-static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
+lazy_static! {
+    static ref NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
+    static ref SESSIONS: Mutex<HashMap<String, Client>> = Mutex::new(HashMap::new());
+}
 
 fn build_session_id() -> String {
     format!("{}", nanoid::nanoid!(21))
@@ -66,21 +73,48 @@ async fn handle_handshake(
     clients: &Arc<Mutex<HashMap<u32, Client>>>,
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     client_id: u32,
+    provided_session_id: Option<String>,
 ) {
-    let session_id = build_session_id();
+    let session_id: String;
+    let virtual_ip: Ipv4Addr;
+    let tun_config: TunConfig;
 
-    let virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
-    let tun_config = TunConfig {
-        name: format!("tun{}", client_id),
-        address: virtual_ip.to_string(),
-        netmask: "255.255.255.0".to_string(),
-        dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
-        mtu: 1400,
-    };
+    if let Some(provided_id) = provided_session_id {
+        // 重连：通过session_id查找原有客户端信息
+        let sessions = SESSIONS.lock().await;
+        if let Some(existing_client) = sessions.get(&provided_id) {
+            session_id = provided_id;
+            virtual_ip = existing_client.virtual_ip;
+            tun_config = existing_client.tun_config.clone();
+            info!("Client reconnecting with session_id: {}, IP: {}", session_id, virtual_ip);
+        } else {
+            // session_id不存在，创建新会话
+            session_id = build_session_id();
+            virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
+            tun_config = TunConfig {
+                name: format!("tun{}", client_id),
+                address: virtual_ip.to_string(),
+                netmask: "255.255.255.0".to_string(),
+                dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
+                mtu: 1400,
+            };
+        }
+    } else {
+        // 新连接：创建新会话
+        session_id = build_session_id();
+        virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
+        tun_config = TunConfig {
+            name: format!("tun{}", client_id),
+            address: virtual_ip.to_string(),
+            netmask: "255.255.255.0".to_string(),
+            dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
+            mtu: 1400,
+        };
+    }
 
     let message = Message::handshake(Handshake {
         session_id: session_id.clone(),
-        tun_config: Some(tun_config),
+        tun_config: Some(tun_config.clone()),
     });
 
     if let Err(e) = transport.send(message, src_addr).await {
@@ -93,8 +127,17 @@ async fn handle_handshake(
         addr: src_addr,
         virtual_ip,
         tx: client_tx,
+        tun_config: tun_config.clone(),
+        last_seen: SystemTime::now(),
     };
 
+    // 更新会话存储
+    {
+        let mut sessions = SESSIONS.lock().await;
+        sessions.insert(session_id.clone(), client.clone());
+    }
+
+    // 更新客户端映射
     {
         let mut clients_map = clients.lock().await;
         clients_map.insert(client_id, client);
@@ -159,7 +202,12 @@ async fn udp_transport_io_task(
                             Some(MessageType::Handshake(handshake)) => {
                                 let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
                                 let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id).await;
+                                let provided_session_id = if handshake.session_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(handshake.session_id.clone())
+                                };
+                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id, provided_session_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -253,7 +301,12 @@ async fn handle_tcp_connection(
                     Some(Ok((msg, src_addr))) => {
                         match msg.msg {
                             Some(MessageType::Handshake(handshake)) => {
-                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id).await;
+                                let provided_session_id = if handshake.session_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(handshake.session_id.clone())
+                                };
+                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id, provided_session_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -372,7 +425,12 @@ async fn handle_ws_connection(
                     Some(Ok((msg, src_addr))) => {
                         match msg.msg {
                             Some(MessageType::Handshake(handshake)) => {
-                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id).await;
+                                let provided_session_id = if handshake.session_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(handshake.session_id.clone())
+                                };
+                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id, provided_session_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -481,6 +539,9 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
+    // 启动会话清理任务
+    tokio::spawn(cleanup_expired_sessions());
+
     let mut tun_config = Configuration::default();
     tun_config
         .tun_name(&config.tun_name)
@@ -562,4 +623,30 @@ pub async fn run_server_with_args(
     info!("Server configuration: {:?}", config);
 
     run_server(config).await
+}
+
+async fn cleanup_expired_sessions() {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+        let mut sessions = SESSIONS.lock().await;
+        let now = SystemTime::now();
+        let mut removed_count = 0;
+
+        sessions.retain(|session_id, client| {
+            let elapsed = now.duration_since(client.last_seen).unwrap_or(Duration::MAX);
+            let should_keep = elapsed < Duration::from_secs(300); // 5分钟未活动则清理
+
+            if !should_keep {
+                info!("Cleaning up expired session: {}, last seen: {:?}", session_id, client.last_seen);
+                removed_count += 1;
+            }
+
+            should_keep
+        });
+
+        if removed_count > 0 {
+            info!("Cleaned up {} expired sessions", removed_count);
+        }
+    }
 }

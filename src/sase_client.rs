@@ -6,15 +6,34 @@ use anyhow::Result;
 use log::{error, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time::{interval, sleep};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref SESSION_ID: Mutex<String> = Mutex::new(String::new());
+}
 
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     server_addr: std::net::SocketAddr,
 ) -> Result<TunConfig> {
-    info!("Handshake with server at {}", server_addr);
+    // 从内存中获取session_id
+    let session_id = {
+        let session = SESSION_ID.lock().await;
+        session.clone()
+    };
+
+    let is_reconnect = !session_id.is_empty();
+
+    if is_reconnect {
+        info!("Reconnecting with session_id: {}", session_id);
+    } else {
+        info!("New connection to server at {}", server_addr);
+    }
+
     let handshake_message = Message::handshake(Handshake {
-        session_id: String::new(),
+        session_id: session_id.clone(),
         tun_config: None,
     });
 
@@ -29,16 +48,25 @@ async fn handshake_async(
                 Some(Ok((msg, _addr))) => {
                     match msg.msg {
                         Some(MessageType::Handshake(handshake)) => {
-
                             if let Some(tun_config) = handshake.tun_config {
-                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}", tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-                                return Ok(TunConfig {
+                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
+                                      tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+
+                                // 保存session_id到内存
+                                {
+                                    let mut session = SESSION_ID.lock().await;
+                                    *session = handshake.session_id.clone();
+                                }
+
+                                let tun_config_obj = TunConfig {
                                     name: tun_config.name,
                                     address: tun_config.address,
                                     netmask: tun_config.netmask,
                                     dns: tun_config.dns,
                                     mtu: tun_config.mtu,
-                                });
+                                };
+
+                                return Ok(tun_config_obj);
                             } else {
                                 return Err(anyhow::anyhow!("No TUN config in handshake response"));
                             }
