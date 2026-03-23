@@ -6,34 +6,25 @@ use anyhow::Result;
 use log::{error, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio::time::{interval, sleep};
-use lazy_static::lazy_static;
+use std::path::Path;
 
-lazy_static! {
-    static ref SESSION_ID: Mutex<String> = Mutex::new(String::new());
-}
+const CONFIG_FILE: &str = "client_config.json";
 
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     server_addr: std::net::SocketAddr,
+    config: &mut ClientConfig,
 ) -> Result<TunConfig> {
-    // 从内存中获取session_id
-    let session_id = {
-        let session = SESSION_ID.lock().await;
-        session.clone()
-    };
-
-    let is_reconnect = !session_id.is_empty();
-
+    let is_reconnect = !config.session_id.is_empty();
     if is_reconnect {
-        info!("Reconnecting with session_id: {}", session_id);
+        info!("Reconnecting with session_id: {}", config.session_id);
     } else {
         info!("New connection to server at {}", server_addr);
     }
 
     let handshake_message = Message::handshake(Handshake {
-        session_id: session_id.clone(),
+        session_id: config.session_id.clone(),
         tun_config: None,
     });
 
@@ -49,13 +40,10 @@ async fn handshake_async(
                     match msg.msg {
                         Some(MessageType::Handshake(handshake)) => {
                             if let Some(tun_config) = handshake.tun_config {
-                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}",
-                                      tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
-
-                                // 保存session_id到内存
-                                {
-                                    let mut session = SESSION_ID.lock().await;
-                                    *session = handshake.session_id.clone();
+                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}", tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
+                                if !is_reconnect {
+                                    config.session_id = handshake.session_id.clone();
+                                    config.save_to_file(CONFIG_FILE)?;
                                 }
 
                                 let tun_config_obj = TunConfig {
@@ -169,6 +157,8 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
+    let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
@@ -179,7 +169,7 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     let transport_handle = tokio::spawn(
         transport_io_task(
             transport,
-            config.server_addr,
+            server_addr,
             tun_rx,
             transport_tx,
         )
@@ -216,6 +206,8 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
+    let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
@@ -226,7 +218,7 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     let transport_handle = tokio::spawn(
         transport_io_task(
             transport,
-            config.server_addr,
+            server_addr,
             tun_rx,
             transport_tx,
         )
@@ -308,13 +300,15 @@ pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
-pub async fn run_client(config: ClientConfig) -> Result<()> {
+pub async fn run_client(mut config: ClientConfig) -> Result<()> {
+    let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+
     match config.transport_type.to_lowercase().as_str() {
         "tcp" => {
             info!("Using TCP transport");
 
-            let mut transport = TcpTransport::connect(config.server_addr.to_string().as_str()).await?;
-            let tun_config= handshake_async(&mut transport, config.server_addr).await?;
+            let mut transport = TcpTransport::connect(&config.server_addr).await?;
+            let tun_config = handshake_async(&mut transport, server_addr, &mut config).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
@@ -325,7 +319,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             info!("Using UDP transport");
 
             let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
-            let tun_config = handshake_async(&mut transport, config.server_addr).await?;
+            let tun_config = handshake_async(&mut transport, server_addr, &mut config).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
@@ -337,8 +331,9 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 
             let ws_url = format!("ws://{}", config.server_addr);
             let mut transport = WsTransport::connect(&ws_url, &config.ca_cert_path).await?;
-            let server_addr = transport.server_addr();
-            let tun_config = handshake_async(&mut transport, server_addr).await?;
+
+            let handshake_addr = transport.server_addr();
+            let tun_config = handshake_async(&mut transport, handshake_addr, &mut config).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
@@ -350,8 +345,9 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 
             let wss_url = format!("wss://{}", config.server_addr);
             let mut transport = WsTransport::connect(&wss_url, &config.ca_cert_path).await?;
-            let server_addr = transport.server_addr();
-            let tun_config = handshake_async(&mut transport, server_addr).await?;
+
+            let handshake_addr = transport.server_addr();
+            let tun_config = handshake_async(&mut transport, handshake_addr, &mut config).await?;
 
             info!("Creating TUN device with server config: {}", tun_config.name);
             let tun_device = create_tun_device(&tun_config)?;
@@ -396,14 +392,18 @@ pub async fn run_client_with_args(
     server_addr: Option<String>,
     ca_cert_path: Option<String>,
 ) -> Result<()> {
-    let mut config = ClientConfig::default();
+    let mut config: ClientConfig = if Path::new(CONFIG_FILE).exists() {
+        ClientConfig::load_from_file(CONFIG_FILE)?
+    } else {
+        ClientConfig::default()
+    };
 
     if let Some(transport_type) = transport_type {
         config.transport_type = transport_type;
     }
 
     if let Some(server_addr) = server_addr {
-        config.server_addr = server_addr.parse()?;
+        config.server_addr = server_addr;
     }
 
     if let Some(ca_cert_path) = ca_cert_path {

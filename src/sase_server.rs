@@ -260,7 +260,7 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
 
-    let transport = UdpTransport::bind(config.bind_addr.to_string().as_str()).await?;
+    let transport = UdpTransport::bind(&config.bind_addr).await?;
 
     let tun_handle = tokio::spawn(
         tun_io_task(
@@ -374,7 +374,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     });
 
     let accept_task = tokio::spawn(async move {
-        let listener = TcpTransport::bind(config.bind_addr.to_string().as_str()).await
+        let listener = TcpTransport::bind(&config.bind_addr).await
             .expect("Failed to bind to address");
         info!("TCP server listening on {}", config.bind_addr);
 
@@ -504,7 +504,7 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
     });
 
     let accept_task = tokio::spawn(async move {
-        let listener = WsTransport::bind(config.bind_addr.to_string().as_str()).await
+        let listener = WsTransport::bind(&config.bind_addr).await
             .expect("Failed to bind to address");
 
         loop {
@@ -593,7 +593,7 @@ pub async fn run_server_with_args(
     }
 
     if let Some(bind_addr) = bind_addr {
-        config.bind_addr = bind_addr.parse()?;
+        config.bind_addr = bind_addr;
     }
 
     if let Some(tun) = tun {

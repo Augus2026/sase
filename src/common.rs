@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const SERVER_ADDR: &str = "127.0.0.1";
@@ -6,27 +6,43 @@ pub const SERVER_PORT: u16 = 12345;
 pub const TUN_NAME: &str = "tun0";
 pub const TUN_MTU: usize = 1500;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClientConfig {
     pub transport_type: String,
-    pub server_addr: SocketAddr,
+    pub server_addr: String,
     pub ca_cert_path: String,
+    pub session_id: String,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             transport_type: "udp".to_string(),
-            server_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT).parse().unwrap(),
+            server_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT),
             ca_cert_path: "certs/ca-cert.pem".to_string(),
+            session_id: String::new(),
         }
+    }
+}
+
+impl ClientConfig {
+    pub fn save_to_file(&self, path: &str) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config = serde_json::from_str(&content)?;
+        Ok(config)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub transport_type: String,
-    pub bind_addr: SocketAddr,
+    pub bind_addr: String,
     pub tun_name: String,
     pub tun_addr: Ipv4Addr,
     pub tun_netmask: Ipv4Addr,
@@ -39,7 +55,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             transport_type: "udp".to_string(),
-            bind_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT).parse().unwrap(),
+            bind_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT),
             tun_name: TUN_NAME.to_string(),
             tun_addr: Ipv4Addr::new(10, 0, 0, 1),
             tun_netmask: Ipv4Addr::new(255, 255, 255, 0),
