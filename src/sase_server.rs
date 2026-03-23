@@ -80,7 +80,6 @@ async fn handle_handshake(
     let tun_config: TunConfig;
 
     if let Some(provided_id) = provided_session_id {
-        // 重连：通过session_id查找原有客户端信息
         let sessions = SESSIONS.lock().await;
         if let Some(existing_client) = sessions.get(&provided_id) {
             session_id = provided_id;
@@ -88,7 +87,6 @@ async fn handle_handshake(
             tun_config = existing_client.tun_config.clone();
             info!("Client reconnecting with session_id: {}, IP: {}", session_id, virtual_ip);
         } else {
-            // session_id不存在，创建新会话
             session_id = build_session_id();
             virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
             tun_config = TunConfig {
@@ -98,9 +96,9 @@ async fn handle_handshake(
                 dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
                 mtu: 1400,
             };
+            info!("Client {} created new session with session_id: {}, IP: {}", client_id, session_id, virtual_ip);
         }
     } else {
-        // 新连接：创建新会话
         session_id = build_session_id();
         virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
         tun_config = TunConfig {
@@ -110,6 +108,7 @@ async fn handle_handshake(
             dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
             mtu: 1400,
         };
+        info!("Client {} created new session with session_id: {}, IP: {}", client_id, session_id, virtual_ip);
     }
 
     let message = Message::handshake(Handshake {
@@ -635,7 +634,7 @@ async fn cleanup_expired_sessions() {
 
         sessions.retain(|session_id, client| {
             let elapsed = now.duration_since(client.last_seen).unwrap_or(Duration::MAX);
-            let should_keep = elapsed < Duration::from_secs(300); // 5分钟未活动则清理
+            let should_keep = elapsed < Duration::from_secs(3600); // 1小时未活动则清理
 
             if !should_keep {
                 info!("Cleaning up expired session: {}, last seen: {:?}", session_id, client.last_seen);
