@@ -39,8 +39,8 @@ async fn handshake_async(
                         Some(MessageType::Handshake(handshake)) => {
                             info!("Received handshake response: {:?}", handshake);
 
-                            if handshake.session_id != config.session_id {
-                                return Err(anyhow::anyhow!("Invalid session_id in handshake response"));
+                            if handshake.token != config.token {
+                                return Err(anyhow::anyhow!("Invalid token in handshake response"));
                             }
 
                             if let Some(tun_config) = handshake.tun_config {
