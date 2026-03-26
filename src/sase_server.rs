@@ -31,9 +31,11 @@ fn build_session_id() -> String {
     format!("{}", nanoid::nanoid!(21))
 }
 
-fn validate_token(token: &str) -> bool {
-    let config = ServerConfig::load().unwrap();
-    config.token == token
+fn validate_token(token: &str, server_token: &str) -> bool {
+    if server_token.is_empty() {
+        return true;
+    }
+    token == server_token
 }
 
 fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
@@ -78,28 +80,29 @@ async fn handle_handshake(
     provided_session_id: Option<String>,
     provided_token: Option<String>,
 ) {
+    let server_token = ServerConfig::load().unwrap().token.clone();
     let session_id: String;
     let virtual_ip: Ipv4Addr;
     let tun_config: TunConfig;
 
-    if let Some(token) = provided_token {
-        if !validate_token(&token) {
-            warn!("Invalid token provided by {}: {}", src_addr, token);
+    if let Some(handshake_token) = provided_token {
+        if !validate_token(&handshake_token, server_token.as_str()) {
+        warn!("Invalid token provided by {}: {}", src_addr, handshake_token);
 
-            let message = Message::handshake(Handshake {
-                token: String::new(),
-                session_id: String::new(),
-                tun_config: None,
-            });
+        let message = Message::handshake(Handshake {
+            token: String::new(),
+            session_id: String::new(),
+            tun_config: None,
+        });
 
-            if let Err(e) = transport.send(message, src_addr).await {
-                error!("Failed to send handshake to {}: {}", src_addr, e);
-                return;
-            }
-
+        if let Err(e) = transport.send(message, src_addr).await {
+            error!("Failed to send handshake to {}: {}", src_addr, e);
             return;
-        } else {
-            info!("Valid token provided by {}: {}", src_addr, token);
+        }
+
+        return;
+    } else {
+        info!("Valid token provided by {}: {}", src_addr, handshake_token);
         }
     }
 
@@ -138,7 +141,7 @@ async fn handle_handshake(
     }
     
     let message = Message::handshake(Handshake {
-        token: String::new(),
+        token: server_token.clone(),
         session_id: session_id.clone(),
         tun_config: Some(tun_config.clone()),
     });

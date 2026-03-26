@@ -37,8 +37,13 @@ async fn handshake_async(
                 Some(Ok((msg, _addr))) => {
                     match msg.msg {
                         Some(MessageType::Handshake(handshake)) => {
+                            info!("Received handshake response: {:?}", handshake);
+
+                            if handshake.session_id != config.session_id {
+                                return Err(anyhow::anyhow!("Invalid session_id in handshake response"));
+                            }
+
                             if let Some(tun_config) = handshake.tun_config {
-                                info!("Received TUN config: name={}, address={}, netmask={}, mtu={}", tun_config.name, tun_config.address, tun_config.netmask, tun_config.mtu);
                                 if handshake.session_id != config.session_id {
                                     info!("Session ID changed: {} -> {}", config.session_id, handshake.session_id);
                                     config.session_id = handshake.session_id.clone();
