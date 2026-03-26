@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, path::Path};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const SERVER_ADDR: &str = "127.0.0.1";
@@ -32,6 +32,9 @@ impl Default for ClientConfig {
 
 impl ClientConfig {
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        if !Path::new(path).exists() {
+            return Ok(Self::default());
+        }
         let content = std::fs::read_to_string(path)?;
         let config = serde_json::from_str(&content)?;
         Ok(config)
@@ -83,6 +86,9 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        if !Path::new(path).exists() {
+            return Ok(Self::default());
+        }
         let content = std::fs::read_to_string(path)?;
         let config = serde_json::from_str(&content)?;
         Ok(config)
