@@ -6,7 +6,6 @@ use log::{error, info, warn};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{collections::HashMap, net::Ipv4Addr};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
@@ -70,9 +69,7 @@ async fn handle_keepalive(
 async fn handle_handshake(
     src_addr: SocketAddr,
     transport: &mut impl TransportTrait<Error = std::io::Error>,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    client_id: u32,
     provided_session_id: Option<String>,
 ) {
     let session_id: String;
@@ -80,14 +77,15 @@ async fn handle_handshake(
     let tun_config: TunConfig;
 
     if let Some(provided_id) = provided_session_id {
-        let sessions = SESSIONS.lock().await;
-        if let Some(existing_client) = sessions.get(&provided_id) {
+        let sessions_map = SESSIONS.lock().await;
+        if let Some(existing_client) = sessions_map.get(&provided_id) {
             session_id = provided_id;
             virtual_ip = existing_client.virtual_ip;
             tun_config = existing_client.tun_config.clone();
             info!("Client reconnecting with session_id: {}, IP: {}", session_id, virtual_ip);
         } else {
             session_id = build_session_id();
+            let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
             virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
             tun_config = TunConfig {
                 name: format!("tun{}", client_id),
@@ -100,6 +98,7 @@ async fn handle_handshake(
         }
     } else {
         session_id = build_session_id();
+        let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
         virtual_ip = Ipv4Addr::new(10, 0, 0, client_id as u8);
         tun_config = TunConfig {
             name: format!("tun{}", client_id),
@@ -130,40 +129,27 @@ async fn handle_handshake(
         last_seen: SystemTime::now(),
     };
 
-    // 更新会话存储
     {
-        let mut sessions = SESSIONS.lock().await;
-        sessions.insert(session_id.clone(), client.clone());
+        let mut sessions_map = SESSIONS.lock().await;
+        sessions_map.insert(session_id.clone(), client.clone());
     }
 
-    // 更新客户端映射
-    {
-        let mut clients_map = clients.lock().await;
-        clients_map.insert(client_id, client);
-    }
-
-    info!("Client {} connected from {}, assigned IP: {}", client_id, src_addr, virtual_ip);
+    info!("Client connected from {}, assigned IP: {}, session_id: {}", src_addr, virtual_ip, session_id);
 }
 
-async fn handle_disconnect(
-    addr: SocketAddr,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-) {
-    let mut clients_map = clients.lock().await;
-    if let Some((client_id, client)) = clients_map.iter().find(|(_, c)| c.addr == addr).map(|(k, v)| (*k, v.clone())) {
-        clients_map.remove(&client_id);
-        info!("Client {} disconnected ({})", client_id, client.addr);
+async fn handle_disconnect(addr: SocketAddr) {
+    let mut sessions_map = SESSIONS.lock().await;
+    if let Some((session_id, client)) = sessions_map.iter().find(|(_k, v)| v.addr == addr).map(|(k, v)| (k.clone(), v.clone())) {
+        sessions_map.remove(&session_id);
+        info!("Client {} disconnected ({})", session_id, client.addr);
     }
 }
 
-async fn handle_tun_packet(
-    tun_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-    clients: &Arc<Mutex<HashMap<u32, Client>>>,
-) {
+async fn handle_tun_packet(tun_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) {
     while let Some(data) = tun_rx.recv().await {
-        let clients_map = clients.lock().await;
+        let sessions_map = SESSIONS.lock().await;
         if let Some(dest_ip) = get_destination_ip(&data) {
-            let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+            let target_client = sessions_map.values().find(|c| c.virtual_ip == dest_ip);
             if let Some(client) = target_client {
                 if let Err(e) = client.tx.send(data).await {
                     warn!("Failed to send to client {}: {}", client.addr, e);
@@ -176,17 +162,19 @@ async fn handle_tun_packet(
 async fn send_to_client(
     data: &[u8],
     transport: &mut impl TransportTrait<Error = std::io::Error>,
-    client: &Client,
+    session_id: &str,
 ) {
-    let message = Message::data(Data { payload: data.to_vec() });
-    if let Err(e) = transport.send(message, client.addr).await {
-        warn!("Failed to send to {}: {}", client.addr, e);
+    let sessions_map = SESSIONS.lock().await;
+    if let Some(client) = sessions_map.get(session_id) {
+        let message = Message::data(Data { payload: data.to_vec() });
+        if let Err(e) = transport.send(message, client.addr).await {
+            warn!("Failed to send to {}: {}", client.addr, e);
+        }
     }
 }
 
 async fn udp_transport_io_task(
     mut transport: UdpTransport,
-    clients: Arc<Mutex<HashMap<u32, Client>>>,
     mut tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
@@ -199,14 +187,13 @@ async fn udp_transport_io_task(
                     Some(Ok((msg, src_addr))) => {
                         match msg.msg {
                             Some(MessageType::Handshake(handshake)) => {
-                                let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
                                 let (dummy_tx, _) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
                                 let provided_session_id = if handshake.session_id.is_empty() {
                                     None
                                 } else {
                                     Some(handshake.session_id.clone())
                                 };
-                                handle_handshake(src_addr, &mut transport, &clients, dummy_tx, client_id, provided_session_id).await;
+                                handle_handshake(src_addr, &mut transport, dummy_tx, provided_session_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -215,7 +202,7 @@ async fn udp_transport_io_task(
                                 handle_keepalive(src_addr, &mut transport, keepalive.timestamp).await;
                             }
                             Some(MessageType::Disconnect(disconnect)) => {
-                                handle_disconnect(src_addr, &clients).await;
+                                handle_disconnect(src_addr).await;
                                 info!("Client {} disconnected: {}", src_addr, disconnect.reason);
                             }
                             _ => {
@@ -236,11 +223,11 @@ async fn udp_transport_io_task(
             result = tun_rx.recv() => {
                 match result {
                     Some(data) => {
-                        let clients_map = clients.lock().await;
+                        let sessions_map = SESSIONS.lock().await;
                         if let Some(dest_ip) = get_destination_ip(&data) {
-                            let target_client = clients_map.values().find(|c| c.virtual_ip == dest_ip);
+                            let target_client = sessions_map.values().find(|c| c.virtual_ip == dest_ip);
                             if let Some(client) = target_client {
-                                send_to_client(&data, &mut transport, client).await;
+                                send_to_client(&data, &mut transport, client.session_id.as_str()).await;
                             }
                         }
                     }
@@ -257,7 +244,6 @@ async fn udp_transport_io_task(
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
 
     let transport = UdpTransport::bind(&config.bind_addr).await?;
 
@@ -271,7 +257,6 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
     let transport_handle = tokio::spawn(
         udp_transport_io_task(
             transport,
-            Arc::clone(&clients),
             tun_rx,
             transport_tx
         )
@@ -286,9 +271,7 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
 async fn handle_tcp_connection(
     mut tcp_transport: TcpTransport,
-    client_id: u32,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    clients: Arc<Mutex<HashMap<u32, Client>>>,
 ) {
     let peer_addr = tcp_transport.peer_addr();
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -305,7 +288,7 @@ async fn handle_tcp_connection(
                                 } else {
                                     Some(handshake.session_id.clone())
                                 };
-                                handle_handshake(peer_addr, &mut tcp_transport, &clients, client_tx.clone(), client_id, provided_session_id).await;
+                                handle_handshake(peer_addr, &mut tcp_transport, client_tx.clone(), provided_session_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -314,7 +297,7 @@ async fn handle_tcp_connection(
                                 handle_keepalive(src_addr, &mut tcp_transport, keepalive.timestamp).await;
                             }
                             Some(MessageType::Disconnect(disconnect)) => {
-                                handle_disconnect(src_addr, &clients).await;
+                                handle_disconnect(src_addr).await;
                                 info!("Client {} disconnected: {}", src_addr, disconnect.reason);
                             }
                             _ => {
@@ -350,15 +333,12 @@ async fn handle_tcp_connection(
         }
     }
 
-    let mut clients_map = clients.lock().await;
-    clients_map.remove(&client_id);
+    handle_disconnect(peer_addr).await;
 }
 
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
-
     let tun_handle = tokio::spawn(
         tun_io_task(
             tun,
@@ -367,9 +347,8 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         )
     );
 
-    let clients_clone = Arc::clone(&clients);
     tokio::spawn(async move {
-        handle_tun_packet(&mut tun_rx, &clients_clone).await;
+        handle_tun_packet(&mut tun_rx).await;
     });
 
     let accept_task = tokio::spawn(async move {
@@ -380,17 +359,14 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
         loop {
             match TcpTransport::accept(&listener).await {
                 Ok(tcp_transport) => {
-                    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+                    let _client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
 
                     let tx = transport_tx.clone();
-                    let clients = Arc::clone(&clients);
 
                     tokio::spawn(async move {
                         handle_tcp_connection(
                             tcp_transport,
-                            client_id,
                             tx,
-                            clients,
                         ).await
                     });
                 }
@@ -410,9 +386,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
 async fn handle_ws_connection(
     mut ws_transport: WsTransport,
-    client_id: u32,
     transport_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    clients: Arc<Mutex<HashMap<u32, Client>>>,
 ) {
     let peer_addr = ws_transport.peer_addr();
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
@@ -429,7 +403,7 @@ async fn handle_ws_connection(
                                 } else {
                                     Some(handshake.session_id.clone())
                                 };
-                                handle_handshake(peer_addr, &mut ws_transport, &clients, client_tx.clone(), client_id, provided_session_id).await;
+                                handle_handshake(peer_addr, &mut ws_transport, client_tx.clone(), provided_session_id).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -438,7 +412,7 @@ async fn handle_ws_connection(
                                 handle_keepalive(src_addr, &mut ws_transport, keepalive.timestamp).await;
                             }
                             Some(MessageType::Disconnect(disconnect)) => {
-                                handle_disconnect(src_addr, &clients).await;
+                                handle_disconnect(src_addr).await;
                                 info!("Client {} disconnected: {}", src_addr, disconnect.reason);
                             }
                             _ => {
@@ -474,14 +448,12 @@ async fn handle_ws_connection(
         }
     }
 
-    let mut clients_map = clients.lock().await;
-    clients_map.remove(&client_id);
+    handle_disconnect(peer_addr).await;
 }
 
 async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let clients = Arc::new(Mutex::new(HashMap::<u32, Client>::new()));
 
     let tls_acceptor = if config.transport_type == "wss" {
         Some(WsTransport::create_tls_acceptor(&config.cert_path, &config.key_path).unwrap())
@@ -497,9 +469,8 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
         )
     );
 
-    let clients_clone = Arc::clone(&clients);
     tokio::spawn(async move {
-        handle_tun_packet(&mut tun_rx, &clients_clone).await;
+        handle_tun_packet(&mut tun_rx).await;
     });
 
     let accept_task = tokio::spawn(async move {
@@ -509,17 +480,12 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
         loop {
             match WsTransport::accept(&listener, tls_acceptor.as_ref().map(|a| a.clone())).await {
                 Ok(ws_transport) => {
-                    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
-
                     let tx = transport_tx.clone();
-                    let clients = Arc::clone(&clients);
 
                     tokio::spawn(async move {
                         handle_ws_connection(
                             ws_transport,
-                            client_id,
                             tx,
-                            clients,
                         ).await
                     });
                 }
