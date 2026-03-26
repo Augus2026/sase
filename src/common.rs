@@ -15,6 +15,7 @@ pub struct ClientConfig {
     pub server_addr: String,
     pub ca_cert_path: String,
     pub session_id: String,
+    pub token: String,
 }
 
 impl Default for ClientConfig {
@@ -24,21 +25,30 @@ impl Default for ClientConfig {
             server_addr: format!("{}:{}", SERVER_ADDR, SERVER_PORT),
             ca_cert_path: "certs/ca-cert.pem".to_string(),
             session_id: String::new(),
+            token: String::new(),
         }
     }
 }
 
 impl ClientConfig {
+    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
     pub fn save_to_file(&self, path: &str) -> anyhow::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
-    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config = serde_json::from_str(&content)?;
-        Ok(config)
+    pub fn load() -> anyhow::Result<Self> {
+        Self::load_from_file(CLIENT_CONFIG_PATH)
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to_file(CLIENT_CONFIG_PATH)
     }
 }
 
@@ -52,6 +62,7 @@ pub struct ServerConfig {
     pub mtu: usize,
     pub cert_path: String,
     pub key_path: String,
+    pub token: String,
 }
 
 impl Default for ServerConfig {
@@ -65,21 +76,30 @@ impl Default for ServerConfig {
             mtu: TUN_MTU,
             cert_path: "certs/server-cert.pem".to_string(),
             key_path: "certs/server-key.pem".to_string(),
+            token: String::new(),
         }
     }
 }
 
 impl ServerConfig {
+    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
     pub fn save_to_file(&self, path: &str) -> anyhow::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
-    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config = serde_json::from_str(&content)?;
-        Ok(config)
+    pub fn load() -> anyhow::Result<Self> {
+        Self::load_from_file(SERVER_CONFIG_PATH)
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to_file(SERVER_CONFIG_PATH)
     }
 }
 

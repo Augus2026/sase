@@ -1,4 +1,4 @@
-use crate::common::{ClientConfig, CLIENT_CONFIG_PATH, tun_io_task};
+use crate::common::{ClientConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive};
 use crate::tun_config::{TunConfig, create_tun_device};
@@ -7,7 +7,6 @@ use log::{error, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
-use std::path::Path;
 
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
@@ -22,6 +21,7 @@ async fn handshake_async(
     }
 
     let handshake_message = Message::handshake(Handshake {
+        token: config.token.clone(),
         session_id: config.session_id.clone(),
         tun_config: None,
     });
@@ -42,7 +42,7 @@ async fn handshake_async(
                                 if handshake.session_id != config.session_id {
                                     info!("Session ID changed: {} -> {}", config.session_id, handshake.session_id);
                                     config.session_id = handshake.session_id.clone();
-                                    config.save_to_file(CLIENT_CONFIG_PATH)?;
+                                    config.save()?;
                                 }
 
                                 let tun_config_obj = TunConfig {
@@ -390,12 +390,9 @@ pub async fn run_client_with_args(
     transport_type: Option<String>,
     server_addr: Option<String>,
     ca_cert_path: Option<String>,
+    token: Option<String>,
 ) -> Result<()> {
-    let mut config: ClientConfig = if Path::new(CLIENT_CONFIG_PATH).exists() {
-        ClientConfig::load_from_file(CLIENT_CONFIG_PATH)?
-    } else {
-        ClientConfig::default()
-    };
+    let mut config: ClientConfig = ClientConfig::load()?;
 
     if let Some(transport_type) = transport_type {
         config.transport_type = transport_type;
@@ -409,6 +406,11 @@ pub async fn run_client_with_args(
         config.ca_cert_path = ca_cert_path;
     }
 
+    if let Some(token) = token {
+        config.token = token;
+    }
+
+    config.save()?;
     info!("Client configuration: {:?}", config);
 
     run_client_with_retry(config).await

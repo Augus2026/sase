@@ -11,8 +11,9 @@ message TunConfig {
 }
 
 message Handshake {
-  string session_id = 1;
-  TunConfig tun_config = 2;
+  string token = 1;
+  string session_id = 2;
+  TunConfig tun_config = 3;
 }
 
 message Data {

@@ -46,6 +46,9 @@ enum Commands {
 
         #[arg(short, long)]
         key_path: Option<String>,
+
+        #[arg(long)]
+        token: Option<String>,
     },
     Client {
         #[arg(short, long)]
@@ -56,6 +59,9 @@ enum Commands {
 
         #[arg(short, long)]
         ca_cert_path: Option<String>,
+
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -74,6 +80,7 @@ async fn main() -> Result<()> {
             mtu,
             cert_path,
             key_path,
+            token,
         } => {
             env_logger::Builder::from_env(
                 env_logger::Env::default().default_filter_or(log_level),
@@ -81,12 +88,13 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Server");
-            sase_server::run_server_with_args(transport_type, bind_addr, tun, address, netmask, mtu, cert_path, key_path).await
+            sase_server::run_server_with_args(transport_type, bind_addr, tun, address, netmask, mtu, cert_path, key_path, token).await
         }
         Commands::Client {
             transport_type,
             server_addr,
             ca_cert_path,
+            token,
         } => {
             env_logger::Builder::from_env(
                 env_logger::Env::default().default_filter_or(log_level),
@@ -94,7 +102,7 @@ async fn main() -> Result<()> {
             .init();
 
             info!("Starting SASE VPN Client");
-            sase_client::run_client_with_args(transport_type, server_addr, ca_cert_path).await
+            sase_client::run_client_with_args(transport_type, server_addr, ca_cert_path, token).await
         }
     }
 }

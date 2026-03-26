@@ -1,5 +1,4 @@
-use crate::common::{ServerConfig, SERVER_CONFIG_PATH, tun_io_task};
-use std::path::Path;
+use crate::common::{ServerConfig, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive, TunConfig};
 use anyhow::Result;
@@ -30,6 +29,11 @@ lazy_static! {
 
 fn build_session_id() -> String {
     format!("{}", nanoid::nanoid!(21))
+}
+
+fn validate_token(token: &str) -> bool {
+    let config = ServerConfig::load().unwrap();
+    config.token == token
 }
 
 fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
@@ -72,10 +76,32 @@ async fn handle_handshake(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     provided_session_id: Option<String>,
+    provided_token: Option<String>,
 ) {
     let session_id: String;
     let virtual_ip: Ipv4Addr;
     let tun_config: TunConfig;
+
+    if let Some(token) = provided_token {
+        if !validate_token(&token) {
+            warn!("Invalid token provided by {}: {}", src_addr, token);
+
+            let message = Message::handshake(Handshake {
+                token: String::new(),
+                session_id: String::new(),
+                tun_config: None,
+            });
+
+            if let Err(e) = transport.send(message, src_addr).await {
+                error!("Failed to send handshake to {}: {}", src_addr, e);
+                return;
+            }
+
+            return;
+        } else {
+            info!("Valid token provided by {}: {}", src_addr, token);
+        }
+    }
 
     if let Some(provided_id) = provided_session_id {
         let sessions_map = SESSIONS.lock().await;
@@ -110,8 +136,9 @@ async fn handle_handshake(
         };
         info!("Client {} created new session with session_id: {}, IP: {}", client_id, session_id, virtual_ip);
     }
-
+    
     let message = Message::handshake(Handshake {
+        token: String::new(),
         session_id: session_id.clone(),
         tun_config: Some(tun_config.clone()),
     });
@@ -194,7 +221,12 @@ async fn udp_transport_io_task(
                                 } else {
                                     Some(handshake.session_id.clone())
                                 };
-                                handle_handshake(src_addr, &mut transport, dummy_tx, provided_session_id).await;
+                                let provided_token = if handshake.token.is_empty() {
+                                    None
+                                } else {
+                                    Some(handshake.token.clone())
+                                };
+                                handle_handshake(src_addr, &mut transport, dummy_tx, provided_session_id, provided_token).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -289,7 +321,12 @@ async fn handle_tcp_connection(
                                 } else {
                                     Some(handshake.session_id.clone())
                                 };
-                                handle_handshake(peer_addr, &mut tcp_transport, client_tx.clone(), provided_session_id).await;
+                                let provided_token = if handshake.token.is_empty() {
+                                    None
+                                } else {
+                                    Some(handshake.token.clone())
+                                };
+                                handle_handshake(peer_addr, &mut tcp_transport, client_tx.clone(), provided_session_id, provided_token).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -404,7 +441,12 @@ async fn handle_ws_connection(
                                 } else {
                                     Some(handshake.session_id.clone())
                                 };
-                                handle_handshake(peer_addr, &mut ws_transport, client_tx.clone(), provided_session_id).await;
+                                let provided_token = if handshake.token.is_empty() {
+                                    None
+                                } else {
+                                    Some(handshake.token.clone())
+                                };
+                                handle_handshake(peer_addr, &mut ws_transport, client_tx.clone(), provided_session_id, provided_token).await;
                             }
                             Some(MessageType::Data(data)) => {
                                 handle_data(&data.payload, &transport_tx).await;
@@ -505,7 +547,6 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
-    // 启动会话清理任务
     tokio::spawn(cleanup_expired_sessions());
 
     let mut tun_config = Configuration::default();
@@ -551,12 +592,9 @@ pub async fn run_server_with_args(
     mtu: Option<usize>,
     cert_path: Option<String>,
     key_path: Option<String>,
+    token: Option<String>,
 ) -> Result<()> {
-    let mut config: ServerConfig = if Path::new(SERVER_CONFIG_PATH).exists() {
-        ServerConfig::load_from_file(SERVER_CONFIG_PATH)?
-    } else {
-        ServerConfig::default()
-    };
+    let mut config: ServerConfig = ServerConfig::load()?;
 
     if let Some(transport_type) = transport_type {
         config.transport_type = transport_type;
@@ -590,8 +628,11 @@ pub async fn run_server_with_args(
         config.key_path = key_path;
     }
 
-    // 保存配置到文件
-    config.save_to_file(SERVER_CONFIG_PATH)?;
+    if let Some(token) = token {
+        config.token = token;
+    }
+
+    config.save()?;
 
     info!("Server configuration: {:?}", config);
 
@@ -608,7 +649,7 @@ async fn cleanup_expired_sessions() {
 
         sessions.retain(|session_id, client| {
             let elapsed = now.duration_since(client.last_seen).unwrap_or(Duration::MAX);
-            let should_keep = elapsed < Duration::from_secs(3600); // 1小时未活动则清理
+            let should_keep = elapsed < Duration::from_secs(3600);
 
             if !should_keep {
                 info!("Cleaning up expired session: {}, last seen: {:?}", session_id, client.last_seen);
