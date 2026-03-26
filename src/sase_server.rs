@@ -1,4 +1,5 @@
-use crate::common::{ServerConfig, tun_io_task};
+use crate::common::{ServerConfig, SERVER_CONFIG_PATH, tun_io_task};
+use std::path::Path;
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive, TunConfig};
 use anyhow::Result;
@@ -12,7 +13,7 @@ use tun2::{create_as_async, Configuration};
 use nanoid;
 use lazy_static::lazy_static;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Client {
     session_id: String,
     addr: SocketAddr,
@@ -551,7 +552,11 @@ pub async fn run_server_with_args(
     cert_path: Option<String>,
     key_path: Option<String>,
 ) -> Result<()> {
-    let mut config = ServerConfig::default();
+    let mut config: ServerConfig = if Path::new(SERVER_CONFIG_PATH).exists() {
+        ServerConfig::load_from_file(SERVER_CONFIG_PATH)?
+    } else {
+        ServerConfig::default()
+    };
 
     if let Some(transport_type) = transport_type {
         config.transport_type = transport_type;
@@ -584,6 +589,9 @@ pub async fn run_server_with_args(
     if let Some(key_path) = key_path {
         config.key_path = key_path;
     }
+
+    // 保存配置到文件
+    config.save_to_file(SERVER_CONFIG_PATH)?;
 
     info!("Server configuration: {:?}", config);
 

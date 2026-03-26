@@ -1,4 +1,4 @@
-use crate::common::{ClientConfig, tun_io_task};
+use crate::common::{ClientConfig, CLIENT_CONFIG_PATH, tun_io_task};
 use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
 use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive};
 use crate::tun_config::{TunConfig, create_tun_device};
@@ -8,8 +8,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use std::path::Path;
-
-const CONFIG_FILE: &str = "client_config.json";
 
 async fn handshake_async(
     transport: &mut impl TransportTrait<Error = std::io::Error>,
@@ -44,7 +42,7 @@ async fn handshake_async(
                                 if handshake.session_id != config.session_id {
                                     info!("Session ID changed: {} -> {}", config.session_id, handshake.session_id);
                                     config.session_id = handshake.session_id.clone();
-                                    config.save_to_file(CONFIG_FILE)?;
+                                    config.save_to_file(CLIENT_CONFIG_PATH)?;
                                 }
 
                                 let tun_config_obj = TunConfig {
@@ -393,8 +391,8 @@ pub async fn run_client_with_args(
     server_addr: Option<String>,
     ca_cert_path: Option<String>,
 ) -> Result<()> {
-    let mut config: ClientConfig = if Path::new(CONFIG_FILE).exists() {
-        ClientConfig::load_from_file(CONFIG_FILE)?
+    let mut config: ClientConfig = if Path::new(CLIENT_CONFIG_PATH).exists() {
+        ClientConfig::load_from_file(CLIENT_CONFIG_PATH)?
     } else {
         ClientConfig::default()
     };

@@ -1,7 +1,7 @@
 use log::info;
 use tun2::{create_as_async, AsyncDevice, Configuration, Layer};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TunConfig {
     pub name: String,
     pub address: String,

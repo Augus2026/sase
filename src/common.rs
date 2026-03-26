@@ -6,6 +6,9 @@ pub const SERVER_PORT: u16 = 12345;
 pub const TUN_NAME: &str = "tun0";
 pub const TUN_MTU: usize = 1500;
 
+pub const CLIENT_CONFIG_PATH:  &str = "client_config.json";
+pub const SERVER_CONFIG_PATH:  &str = "server_config.json";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClientConfig {
     pub transport_type: String,
@@ -39,7 +42,7 @@ impl ClientConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerConfig {
     pub transport_type: String,
     pub bind_addr: String,
@@ -63,6 +66,20 @@ impl Default for ServerConfig {
             cert_path: "certs/server-cert.pem".to_string(),
             key_path: "certs/server-key.pem".to_string(),
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn save_to_file(&self, path: &str) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config = serde_json::from_str(&content)?;
+        Ok(config)
     }
 }
 
