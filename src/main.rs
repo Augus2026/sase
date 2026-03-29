@@ -1,8 +1,9 @@
-mod common;
 mod codec;
-mod transport;
+mod common;
+mod routing;
 mod sase_client;
 mod sase_server;
+mod transport;
 mod tun_config;
 
 use anyhow::Result;
@@ -49,6 +50,10 @@ enum Commands {
 
         #[arg(long)]
         token: Option<String>,
+
+        /// 路由规则配置文件路径
+        #[arg(long)]
+        rules: Option<String>,
     },
     Client {
         #[arg(short, long)]
@@ -62,6 +67,10 @@ enum Commands {
 
         #[arg(long)]
         token: Option<String>,
+
+        /// 路由规则配置文件路径
+        #[arg(long)]
+        rules: Option<String>,
     },
 }
 
@@ -81,28 +90,39 @@ async fn main() -> Result<()> {
             cert_path,
             key_path,
             token,
+            rules,
         } => {
-            env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or(log_level),
-            )
-            .init();
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+                .init();
 
             info!("Starting SASE VPN Server");
-            sase_server::run_server_with_args(transport_type, bind_addr, tun, address, netmask, mtu, cert_path, key_path, token).await
+            sase_server::run_server_with_args(
+                transport_type,
+                bind_addr,
+                tun,
+                address,
+                netmask,
+                mtu,
+                cert_path,
+                key_path,
+                token,
+                rules,
+            )
+            .await
         }
         Commands::Client {
             transport_type,
             server_addr,
             ca_cert_path,
             token,
+            rules,
         } => {
-            env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or(log_level),
-            )
-            .init();
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+                .init();
 
             info!("Starting SASE VPN Client");
-            sase_client::run_client_with_args(transport_type, server_addr, ca_cert_path, token).await
+            sase_client::run_client_with_args(transport_type, server_addr, ca_cert_path, token, rules)
+                .await
         }
     }
 }

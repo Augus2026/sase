@@ -1,3 +1,27 @@
-/target
+# Rust
+/target/
+debug/
+release/
+*.rs.bk
+*.rlib
+*.prof*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and env
+*.log
+.env*
+
+# Project specific
 .claude/*
 client_config.json
+.specify/*
+specs/*

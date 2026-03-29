@@ -1,16 +1,16 @@
-use crate::common::{ServerConfig, tun_io_task};
-use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
-use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive, TunConfig};
+use crate::codec::{Data, Handshake, KeepAlive, Message, MessageType, TunConfig};
+use crate::common::{tun_io_task, ServerConfig};
+use crate::transport::{TcpTransport, TransportTrait, UdpTransport, WsTransport};
 use anyhow::Result;
+use lazy_static::lazy_static;
 use log::{error, info, warn};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::{collections::HashMap, net::Ipv4Addr};
+use nanoid;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
+use std::{collections::HashMap, net::Ipv4Addr};
 use tokio::sync::Mutex;
 use tun2::{create_as_async, Configuration};
-use nanoid;
-use lazy_static::lazy_static;
 
 #[derive(Debug, Clone)]
 struct Client {
@@ -53,10 +53,7 @@ fn get_destination_ip(data: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(dest_ip_bytes))
 }
 
-async fn handle_data(
-    data: &[u8],
-    transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-) {
+async fn handle_data(data: &[u8], transport_tx: &tokio::sync::mpsc::Sender<Vec<u8>>) {
     if let Err(e) = transport_tx.send(data.to_vec()).await {
         warn!("Failed to send to transport writer: {}", e);
     }
@@ -87,22 +84,25 @@ async fn handle_handshake(
 
     if let Some(handshake_token) = provided_token {
         if !validate_token(&handshake_token, server_token.as_str()) {
-        warn!("Invalid token provided by {}: {}", src_addr, handshake_token);
+            warn!(
+                "Invalid token provided by {}: {}",
+                src_addr, handshake_token
+            );
 
-        let message = Message::handshake(Handshake {
-            token: String::new(),
-            session_id: String::new(),
-            tun_config: None,
-        });
+            let message = Message::handshake(Handshake {
+                token: String::new(),
+                session_id: String::new(),
+                tun_config: None,
+            });
 
-        if let Err(e) = transport.send(message, src_addr).await {
-            error!("Failed to send handshake to {}: {}", src_addr, e);
+            if let Err(e) = transport.send(message, src_addr).await {
+                error!("Failed to send handshake to {}: {}", src_addr, e);
+                return;
+            }
+
             return;
-        }
-
-        return;
-    } else {
-        info!("Valid token provided by {}: {}", src_addr, handshake_token);
+        } else {
+            info!("Valid token provided by {}: {}", src_addr, handshake_token);
         }
     }
 
@@ -112,7 +112,10 @@ async fn handle_handshake(
             session_id = provided_id;
             virtual_ip = existing_client.virtual_ip;
             tun_config = existing_client.tun_config.clone();
-            info!("Client reconnecting with session_id: {}, IP: {}", session_id, virtual_ip);
+            info!(
+                "Client reconnecting with session_id: {}, IP: {}",
+                session_id, virtual_ip
+            );
         } else {
             session_id = build_session_id();
             let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
@@ -124,7 +127,10 @@ async fn handle_handshake(
                 dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
                 mtu: 1400,
             };
-            info!("Client {} created new session with session_id: {}, IP: {}", client_id, session_id, virtual_ip);
+            info!(
+                "Client {} created new session with session_id: {}, IP: {}",
+                client_id, session_id, virtual_ip
+            );
         }
     } else {
         session_id = build_session_id();
@@ -137,9 +143,12 @@ async fn handle_handshake(
             dns: vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()],
             mtu: 1400,
         };
-        info!("Client {} created new session with session_id: {}, IP: {}", client_id, session_id, virtual_ip);
+        info!(
+            "Client {} created new session with session_id: {}, IP: {}",
+            client_id, session_id, virtual_ip
+        );
     }
-    
+
     let message = Message::handshake(Handshake {
         token: server_token.clone(),
         session_id: session_id.clone(),
@@ -165,12 +174,19 @@ async fn handle_handshake(
         sessions_map.insert(session_id.clone(), client.clone());
     }
 
-    info!("Client connected from {}, assigned IP: {}, session_id: {}", src_addr, virtual_ip, session_id);
+    info!(
+        "Client connected from {}, assigned IP: {}, session_id: {}",
+        src_addr, virtual_ip, session_id
+    );
 }
 
 async fn handle_disconnect(addr: SocketAddr) {
     let mut sessions_map = SESSIONS.lock().await;
-    if let Some((session_id, client)) = sessions_map.iter().find(|(_k, v)| v.addr == addr).map(|(k, v)| (k.clone(), v.clone())) {
+    if let Some((session_id, client)) = sessions_map
+        .iter()
+        .find(|(_k, v)| v.addr == addr)
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
         sessions_map.remove(&session_id);
         info!("Client {} disconnected ({})", session_id, client.addr);
     }
@@ -197,7 +213,9 @@ async fn send_to_client(
 ) {
     let sessions_map = SESSIONS.lock().await;
     if let Some(client) = sessions_map.get(session_id) {
-        let message = Message::data(Data { payload: data.to_vec() });
+        let message = Message::data(Data {
+            payload: data.to_vec(),
+        });
         if let Err(e) = transport.send(message, client.addr).await {
             warn!("Failed to send to {}: {}", client.addr, e);
         }
@@ -283,20 +301,8 @@ async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
     let transport = UdpTransport::bind(&config.bind_addr).await?;
 
-    let tun_handle = tokio::spawn(
-        tun_io_task(
-            tun,
-            tun_tx,
-            transport_rx
-        )
-    );
-    let transport_handle = tokio::spawn(
-        udp_transport_io_task(
-            transport,
-            tun_rx,
-            transport_tx
-        )
-    );
+    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let transport_handle = tokio::spawn(udp_transport_io_task(transport, tun_rx, transport_tx));
 
     tokio::select! {
         _ = tun_handle => {},
@@ -380,20 +386,15 @@ async fn handle_tcp_connection(
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let tun_handle = tokio::spawn(
-        tun_io_task(
-            tun,
-            tun_tx,
-            transport_rx
-        )
-    );
+    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
 
     tokio::spawn(async move {
         handle_tun_packet(&mut tun_rx).await;
     });
 
     let accept_task = tokio::spawn(async move {
-        let listener = TcpTransport::bind(&config.bind_addr).await
+        let listener = TcpTransport::bind(&config.bind_addr)
+            .await
             .expect("Failed to bind to address");
         info!("TCP server listening on {}", config.bind_addr);
 
@@ -404,12 +405,7 @@ async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<
 
                     let tx = transport_tx.clone();
 
-                    tokio::spawn(async move {
-                        handle_tcp_connection(
-                            tcp_transport,
-                            tx,
-                        ).await
-                    });
+                    tokio::spawn(async move { handle_tcp_connection(tcp_transport, tx).await });
                 }
                 Err(e) => {
                     error!("Failed to accept connection: {}", e);
@@ -507,20 +503,15 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
         None
     };
 
-    let tun_handle = tokio::spawn(
-        tun_io_task(
-            tun,
-            tun_tx,
-            transport_rx
-        )
-    );
+    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
 
     tokio::spawn(async move {
         handle_tun_packet(&mut tun_rx).await;
     });
 
     let accept_task = tokio::spawn(async move {
-        let listener = WsTransport::bind(&config.bind_addr).await
+        let listener = WsTransport::bind(&config.bind_addr)
+            .await
             .expect("Failed to bind to address");
 
         loop {
@@ -528,12 +519,7 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
                 Ok(ws_transport) => {
                     let tx = transport_tx.clone();
 
-                    tokio::spawn(async move {
-                        handle_ws_connection(
-                            ws_transport,
-                            tx,
-                        ).await
-                    });
+                    tokio::spawn(async move { handle_ws_connection(ws_transport, tx).await });
                 }
                 Err(e) => {
                     error!("Failed to accept WS connection: {}", e);
@@ -581,7 +567,10 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         }
         _ => {
             error!("Unknown transport type: {}", config.transport_type);
-            Err(anyhow::anyhow!("Unknown transport type: {}", config.transport_type))
+            Err(anyhow::anyhow!(
+                "Unknown transport type: {}",
+                config.transport_type
+            ))
         }
     }
 }
@@ -596,6 +585,7 @@ pub async fn run_server_with_args(
     cert_path: Option<String>,
     key_path: Option<String>,
     token: Option<String>,
+    rules: Option<String>,
 ) -> Result<()> {
     let mut config: ServerConfig = ServerConfig::load()?;
 
@@ -635,6 +625,10 @@ pub async fn run_server_with_args(
         config.token = token;
     }
 
+    if let Some(rules_path) = rules {
+        config.rules_path = Some(rules_path);
+    }
+
     config.save()?;
 
     info!("Server configuration: {:?}", config);
@@ -651,11 +645,16 @@ async fn cleanup_expired_sessions() {
         let mut removed_count = 0;
 
         sessions.retain(|session_id, client| {
-            let elapsed = now.duration_since(client.last_seen).unwrap_or(Duration::MAX);
+            let elapsed = now
+                .duration_since(client.last_seen)
+                .unwrap_or(Duration::MAX);
             let should_keep = elapsed < Duration::from_secs(3600);
 
             if !should_keep {
-                info!("Cleaning up expired session: {}, last seen: {:?}", session_id, client.last_seen);
+                info!(
+                    "Cleaning up expired session: {}, last seen: {:?}",
+                    session_id, client.last_seen
+                );
                 removed_count += 1;
             }
 

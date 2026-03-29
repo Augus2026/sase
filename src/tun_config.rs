@@ -24,6 +24,9 @@ pub fn create_tun_device(tun_config: &TunConfig) -> anyhow::Result<AsyncDevice> 
         .up();
 
     let device = create_as_async(&config)?;
-    info!("TUN device created: {} -> {}", tun_config.name, tun_config.address);
+    info!(
+        "TUN device created: {} -> {}",
+        tun_config.name, tun_config.address
+    );
     Ok(device)
 }
