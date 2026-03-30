@@ -1,0 +1,80 @@
+name: sase multi-arch build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build for ${{ matrix.job_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job_name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            artifact_name: sase-linux-x64
+          - job_name: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            artifact_name: sase-linux-aarch64v8
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.82"
+          targets: ${{ matrix.target }}
+
+      - name: Build with Cross
+        uses: ClementTsang/cargo-action@v0.0.3
+        with:
+          command: build
+          args: --release --all-features --target=${{ matrix.target }}
+          directory: sase
+          use-cross: true
+
+      - name: Package and export
+        shell: bash
+        run: |
+          cd sase
+          mkdir -p release_dir
+          BINARY_PATH="target/${{ matrix.target }}/release/sase"
+          if [ ! -f "$BINARY_PATH" ]; then
+            echo "Error: Binary not found at $BINARY_PATH"
+            exit 1
+          fi
+          
+          cp "$BINARY_PATH" release_dir/
+          PACKAGE_NAME="${{ matrix.artifact_name }}.tar.gz"
+          tar czvf "$PACKAGE_NAME" -C release_dir .
+          
+          echo "PACKAGE_PATH=sase/$PACKAGE_NAME" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ env.PACKAGE_PATH }}
+
+      - name: Create/Update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.PACKAGE_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
