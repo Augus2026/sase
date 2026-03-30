@@ -36,7 +36,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.82"
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Build with Cross
