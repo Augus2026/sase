@@ -44,25 +44,20 @@ jobs:
         with:
           command: build
           args: --release --all-features --target=${{ matrix.target }}
-          directory: sase
           use-cross: true
 
       - name: Package and export
         shell: bash
         run: |
-          cd sase
-          mkdir -p release_dir
-          BINARY_PATH="target/${{ matrix.target }}/release/sase"
-          if [ ! -f "$BINARY_PATH" ]; then
-            echo "Error: Binary not found at $BINARY_PATH"
-            exit 1
-          fi
-          
-          cp "$BINARY_PATH" release_dir/
+          BINARY_NAME="sase"
+          EXPECTED_PATH="target/${{ matrix.target }}/release/$BINARY_NAME"
+          STAGING_DIR="staging_${{ matrix.job_name }}"
+          mkdir -p "$STAGING_DIR"
+          cp "$EXPECTED_PATH" "$STAGING_DIR/"
+          chmod +x "$STAGING_DIR/$BINARY_NAME"
           PACKAGE_NAME="${{ matrix.artifact_name }}.tar.gz"
-          tar czvf "$PACKAGE_NAME" -C release_dir .
-          
-          echo "PACKAGE_PATH=sase/$PACKAGE_NAME" >> $GITHUB_ENV
+          tar czvf "$PACKAGE_NAME" -C "$STAGING_DIR" .
+          echo "PACKAGE_PATH=$PACKAGE_NAME" >> $GITHUB_ENV
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
