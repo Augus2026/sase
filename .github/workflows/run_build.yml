@@ -38,6 +38,11 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
 
       - name: Build with Cross
         uses: ClementTsang/cargo-action@v0.0.3
