@@ -1,0 +1,12 @@
+{
+  "transport_type": "udp",
+  "bind_addr": "127.0.0.1:12345",
+  "tun_name": "tun0",
+  "tun_addr": "10.0.0.1",
+  "tun_netmask": "255.255.255.0",
+  "mtu": 1500,
+  "cert_path": "certs/server-cert.pem",
+  "key_path": "certs/server-key.pem",
+  "token": "",
+  "rules_path": "config/rules.toml"
+}

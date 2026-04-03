@@ -3,6 +3,8 @@
 cargo run --release -- client --transport udp --server 192.168.147.146:12345
 cargo run --release -- server --transport tcp --bind 0.0.0.0:12345 --tun tun1 --address 10.0.0.1
 
+cargo run --release --bin sase -- client --transport-type ws --server-addr 192.168.6.111:12345 --token admin
+
 <div align="center">
 **Simple And Secure VPN** - 基于 Rust 的高性能 VPN 解决方案
 

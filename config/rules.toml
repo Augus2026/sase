@@ -1,0 +1,19 @@
+default_action = "direct"
+
+[[rules]]
+name = "direct rule"
+priority = 200
+match_cond = { dst_ip = "1.1.1.1/32" }
+action = "direct"
+
+[[rules]]
+name = "proxy rule"
+priority = 100
+match_cond = { dst_ip = "10.0.0.0/8" }
+action = "proxy"
+
+[[rules]]
+name = "drop rule"
+priority = 150
+match_cond = { dst_port = "22", protocol = "tcp" }
+action = "drop"

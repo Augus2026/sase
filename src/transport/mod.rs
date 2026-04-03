@@ -2,4 +2,4 @@
 
 pub mod transport;
 
-pub use transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
+pub use transport::{TcpTransport, TransportTrait, UdpTransport, WsTransport};

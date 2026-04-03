@@ -1,7 +1,7 @@
-use crate::common::{ClientConfig, tun_io_task};
-use crate::transport::{TransportTrait, TcpTransport, UdpTransport, WsTransport};
-use crate::codec::{Message, MessageType, Handshake, Data, KeepAlive};
-use crate::tun_config::{TunConfig, create_tun_device};
+use crate::codec::{Data, Handshake, KeepAlive, Message, MessageType};
+use crate::common::{load_routing_engine, tun_io_task, ClientConfig};
+use crate::transport::{TcpTransport, TransportTrait, UdpTransport, WsTransport};
+use crate::tun_config::{create_tun_device, TunConfig};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::time::Duration;
@@ -157,27 +157,30 @@ where
     }
 }
 
-pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: TcpTransport) -> Result<()> {
+pub async fn run_tcp_client(
+    config: ClientConfig,
+    tun: tun2::AsyncDevice,
+    transport: TcpTransport,
+) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "client")?;
 
-    let tun_handle = tokio::spawn(
-        tun_io_task(
-            tun,
-            tun_tx,
-            transport_rx
-        )
-    );
-    let transport_handle = tokio::spawn(
-        transport_io_task(
-            transport,
-            server_addr,
-            tun_rx,
-            transport_tx,
-        )
-    );
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "client",
+    ));
+    let transport_handle = tokio::spawn(transport_io_task(
+        transport,
+        server_addr,
+        tun_rx,
+        transport_tx,
+    ));
 
     tokio::select! {
         result = tun_handle => {
@@ -206,27 +209,30 @@ pub async fn run_tcp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
-pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transport: UdpTransport) -> Result<()> {
+pub async fn run_udp_client(
+    config: ClientConfig,
+    tun: tun2::AsyncDevice,
+    transport: UdpTransport,
+) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "client")?;
 
-    let tun_handle = tokio::spawn(
-        tun_io_task(
-            tun,
-            tun_tx,
-            transport_rx
-        )
-    );
-    let transport_handle = tokio::spawn(
-        transport_io_task(
-            transport,
-            server_addr,
-            tun_rx,
-            transport_tx,
-        )
-    );
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "client",
+    ));
+    let transport_handle = tokio::spawn(transport_io_task(
+        transport,
+        server_addr,
+        tun_rx,
+        transport_tx,
+    ));
 
     tokio::select! {
         result = tun_handle => {
@@ -255,27 +261,30 @@ pub async fn run_udp_client(config: ClientConfig, tun: tun2::AsyncDevice, transp
     Ok(())
 }
 
-pub async fn run_ws_client(_config: ClientConfig, tun: tun2::AsyncDevice, transport: WsTransport) -> Result<()> {
+pub async fn run_ws_client(
+    _config: ClientConfig,
+    tun: tun2::AsyncDevice,
+    transport: WsTransport,
+) -> Result<()> {
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let server_addr = transport.server_addr();
+    let routing_engine = load_routing_engine(_config.rules_path.as_deref(), "client")?;
 
-    let tun_handle = tokio::spawn(
-        tun_io_task(
-            tun,
-            tun_tx,
-            transport_rx
-        )
-    );
-    let transport_handle = tokio::spawn(
-        transport_io_task(
-            transport,
-            server_addr,
-            tun_rx,
-            transport_tx,
-        )
-    );
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "client",
+    ));
+    let transport_handle = tokio::spawn(transport_io_task(
+        transport,
+        server_addr,
+        tun_rx,
+        transport_tx,
+    ));
 
     tokio::select! {
         result = tun_handle => {
@@ -314,7 +323,10 @@ pub async fn run_client(mut config: ClientConfig) -> Result<()> {
             let mut transport = TcpTransport::connect(&config.server_addr).await?;
             let tun_config = handshake_async(&mut transport, server_addr, &mut config).await?;
 
-            info!("Creating TUN device with server config: {}", tun_config.name);
+            info!(
+                "Creating TUN device with server config: {}",
+                tun_config.name
+            );
             let tun_device = create_tun_device(&tun_config)?;
 
             run_tcp_client(config, tun_device, transport).await?;
@@ -325,7 +337,10 @@ pub async fn run_client(mut config: ClientConfig) -> Result<()> {
             let mut transport = UdpTransport::bind("0.0.0.0:0").await?;
             let tun_config = handshake_async(&mut transport, server_addr, &mut config).await?;
 
-            info!("Creating TUN device with server config: {}", tun_config.name);
+            info!(
+                "Creating TUN device with server config: {}",
+                tun_config.name
+            );
             let tun_device = create_tun_device(&tun_config)?;
 
             run_udp_client(config, tun_device, transport).await?;
@@ -339,7 +354,10 @@ pub async fn run_client(mut config: ClientConfig) -> Result<()> {
             let handshake_addr = transport.server_addr();
             let tun_config = handshake_async(&mut transport, handshake_addr, &mut config).await?;
 
-            info!("Creating TUN device with server config: {}", tun_config.name);
+            info!(
+                "Creating TUN device with server config: {}",
+                tun_config.name
+            );
             let tun_device = create_tun_device(&tun_config)?;
 
             run_ws_client(config, tun_device, transport).await?;
@@ -353,14 +371,20 @@ pub async fn run_client(mut config: ClientConfig) -> Result<()> {
             let handshake_addr = transport.server_addr();
             let tun_config = handshake_async(&mut transport, handshake_addr, &mut config).await?;
 
-            info!("Creating TUN device with server config: {}", tun_config.name);
+            info!(
+                "Creating TUN device with server config: {}",
+                tun_config.name
+            );
             let tun_device = create_tun_device(&tun_config)?;
 
             run_ws_client(config, tun_device, transport).await?;
         }
         _ => {
             error!("Unknown transport type: {}", config.transport_type);
-            return Err(anyhow::anyhow!("Unknown transport type: {}", config.transport_type));
+            return Err(anyhow::anyhow!(
+                "Unknown transport type: {}",
+                config.transport_type
+            ));
         }
     }
 
@@ -396,6 +420,7 @@ pub async fn run_client_with_args(
     server_addr: Option<String>,
     ca_cert_path: Option<String>,
     token: Option<String>,
+    rules: Option<String>,
 ) -> Result<()> {
     let mut config: ClientConfig = ClientConfig::load()?;
 
@@ -413,6 +438,10 @@ pub async fn run_client_with_args(
 
     if let Some(token) = token {
         config.token = token;
+    }
+
+    if let Some(rules_path) = rules {
+        config.rules_path = Some(rules_path);
     }
 
     config.save()?;

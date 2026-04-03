@@ -7,8 +7,14 @@ edition = "2021"
 name = "sase"
 path = "src/main.rs"
 
+[lib]
+name = "sase_routing"
+path = "src/routing/lib.rs"
+
 [dependencies]
 tun2 = { version = "4.0", features = ["async"] }
+ipnetwork = "0.20"
+toml = "0.8"
 tokio = { version = "1.40", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 etherparse = "0.19.0"

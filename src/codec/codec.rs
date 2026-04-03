@@ -1,7 +1,7 @@
 //! Custom codec for encoding and decoding protobuf Messages
 
-use prost::Message as _;
 use bytes::{Buf, BufMut, BytesMut};
+use prost::Message as _;
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 include!(concat!(env!("OUT_DIR"), "/sase.rs"));
@@ -9,19 +9,21 @@ include!(concat!(env!("OUT_DIR"), "/sase.rs"));
 // Convenience functions for creating protobuf messages
 impl Message {
     pub fn handshake(handshake: Handshake) -> Self {
-        Self { msg: Some(message::Msg::Handshake(handshake)) }
+        Self {
+            msg: Some(message::Msg::Handshake(handshake)),
+        }
     }
 
     pub fn data(data: Data) -> Self {
-        Self { msg: Some(message::Msg::Data(data)) }
+        Self {
+            msg: Some(message::Msg::Data(data)),
+        }
     }
 
     pub fn keepalive(keepalive: KeepAlive) -> Self {
-        Self { msg: Some(message::Msg::Keepalive(keepalive)) }
-    }
-
-    pub fn disconnect(disconnect: Disconnect) -> Self {
-        Self { msg: Some(message::Msg::Disconnect(disconnect)) }
+        Self {
+            msg: Some(message::Msg::Keepalive(keepalive)),
+        }
     }
 }
 
@@ -61,11 +63,6 @@ impl ByteCodec {
             max_frame_size,
         }
     }
-
-    /// Calculate the total frame size for a given protobuf message
-    pub fn calculate_frame_size(message: &Message) -> usize {
-        HEADER_SIZE + message.encoded_len()
-    }
 }
 
 /// Decoder state machine
@@ -74,9 +71,7 @@ pub enum DecodeState {
     /// Waiting to read frame header
     Head,
     /// Reading frame body
-    Body {
-        data_len: usize,
-    },
+    Body { data_len: usize },
 }
 
 impl Default for DecodeState {
@@ -97,7 +92,10 @@ impl Encoder<Message> for ByteCodec {
         if required > self.max_frame_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Frame size {} exceeds maximum {}", required, self.max_frame_size),
+                format!(
+                    "Frame size {} exceeds maximum {}",
+                    required, self.max_frame_size
+                ),
             ));
         }
 
@@ -134,7 +132,10 @@ impl Decoder for ByteCodec {
                 if data_len > self.max_frame_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Data length {} exceeds maximum {}", data_len, self.max_frame_size),
+                        format!(
+                            "Data length {} exceeds maximum {}",
+                            data_len, self.max_frame_size
+                        ),
                     ));
                 }
 
