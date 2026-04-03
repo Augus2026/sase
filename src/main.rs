@@ -1,6 +1,5 @@
 mod codec;
 mod common;
-mod routing;
 mod sase_client;
 mod sase_server;
 mod transport;

@@ -1,11 +1,6 @@
 use std::{net::Ipv4Addr, path::Path};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::routing::{
-    context::PacketContext, decision::RoutingDecision, engine::HotReloadableEngine,
-    rule::Protocol,
-};
-
 pub const SERVER_ADDR: &str = "127.0.0.1";
 pub const SERVER_PORT: u16 = 12345;
 pub const TUN_NAME: &str = "tun0";
@@ -145,61 +140,6 @@ pub async fn tun_io_task(
                 match result {
                     Ok(n) => {
                         let data = tun_buf[..n].to_vec();
-                        if let Err(e) = tun_tx.send(data).await {
-                            return Err(anyhow::anyhow!("Failed to send to transport: {}", e));
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("Error reading from TUN: {}", e));
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub async fn tun_io_task_with_routing(
-    mut tun: tun2::AsyncDevice,
-    tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    mut transport_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    routing_engine: Option<HotReloadableEngine>,
-) -> anyhow::Result<()> {
-    let mut tun_buf = vec![0u8; TUN_MTU];
-    loop {
-        tokio::select! {
-            result = transport_rx.recv() => {
-                match result {
-                    Some(data) => {
-                        if let Err(e) = tun.write_all(&data).await {
-                            return Err(anyhow::anyhow!("Failed to write to TUN: {}", e));
-                        }
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!("Channel disconnected"));
-                    }
-                }
-            }
-
-            result = tun.read(&mut tun_buf) => {
-                match result {
-                    Ok(n) => {
-                        let data = tun_buf[..n].to_vec();
-
-                        if let Some(ref engine) = routing_engine {
-                            if let Some(packet_ctx) = PacketContext::from_ip_packet(&data) {
-                                let decision = engine.match_packet(&packet_ctx);
-                                if decision.is_drop() {
-                                    log::debug!(
-                                        "[DROP] Packet dropped: src={} dst={} action={}",
-                                        packet_ctx.src_ip,
-                                        packet_ctx.dst_ip,
-                                        decision
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-
                         if let Err(e) = tun_tx.send(data).await {
                             return Err(anyhow::anyhow!("Failed to send to transport: {}", e));
                         }

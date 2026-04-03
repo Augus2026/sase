@@ -3,7 +3,7 @@
 //! TOML 配置文件的解析和验证
 
 use super::action::RoutingAction;
-use super::rule::{MatchCondition, Protocol, RoutingRule};
+use super::rule::{Protocol, RoutingRule};
 use serde::{Deserialize, Serialize};
 use std::io;
 

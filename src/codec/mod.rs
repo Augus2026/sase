@@ -3,6 +3,5 @@
 pub mod codec;
 
 pub use codec::{
-    message::Msg as MessageType, ByteCodec, Data, Disconnect, Handshake, KeepAlive, Message,
-    TunConfig,
+    message::Msg as MessageType, ByteCodec, Data, Handshake, KeepAlive, Message, TunConfig,
 };

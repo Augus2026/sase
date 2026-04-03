@@ -25,12 +25,6 @@ impl Message {
             msg: Some(message::Msg::Keepalive(keepalive)),
         }
     }
-
-    pub fn disconnect(disconnect: Disconnect) -> Self {
-        Self {
-            msg: Some(message::Msg::Disconnect(disconnect)),
-        }
-    }
 }
 
 /// Header size constant (4 bytes for length prefix)
@@ -68,11 +62,6 @@ impl ByteCodec {
             state: DecodeState::Head,
             max_frame_size,
         }
-    }
-
-    /// Calculate the total frame size for a given protobuf message
-    pub fn calculate_frame_size(message: &Message) -> usize {
-        HEADER_SIZE + message.encoded_len()
     }
 }
 
