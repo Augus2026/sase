@@ -130,10 +130,10 @@ match_cond = { dst_port = "22", protocol = "tcp" }
 action = "drop"
 
 [[rules]]
-name = "intranet"
+name = "private network"
 priority = 100
 match_cond = { dst_ip = "10.0.0.0/8" }
-action = "intranet"
+action = "proxy"
 
 [[rules]]
 name = "https proxy"

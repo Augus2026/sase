@@ -1,5 +1,5 @@
 use crate::codec::{Data, Handshake, KeepAlive, Message, MessageType, TunConfig};
-use crate::common::{tun_io_task, ServerConfig};
+use crate::common::{load_routing_engine, tun_io_task, ServerConfig};
 use crate::transport::{TcpTransport, TransportTrait, UdpTransport, WsTransport};
 use anyhow::Result;
 use lazy_static::lazy_static;
@@ -298,10 +298,17 @@ async fn udp_transport_io_task(
 async fn run_udp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "server")?;
 
     let transport = UdpTransport::bind(&config.bind_addr).await?;
 
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "server",
+    ));
     let transport_handle = tokio::spawn(udp_transport_io_task(transport, tun_rx, transport_tx));
 
     tokio::select! {
@@ -386,7 +393,14 @@ async fn handle_tcp_connection(
 async fn run_tcp_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "server")?;
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "server",
+    ));
 
     tokio::spawn(async move {
         handle_tun_packet(&mut tun_rx).await;
@@ -496,6 +510,7 @@ async fn handle_ws_connection(
 async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<()> {
     let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (transport_tx, transport_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "server")?;
 
     let tls_acceptor = if config.transport_type == "wss" {
         Some(WsTransport::create_tls_acceptor(&config.cert_path, &config.key_path).unwrap())
@@ -503,7 +518,13 @@ async fn run_ws_server(config: ServerConfig, tun: tun2::AsyncDevice) -> Result<(
         None
     };
 
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "server",
+    ));
 
     tokio::spawn(async move {
         handle_tun_packet(&mut tun_rx).await;

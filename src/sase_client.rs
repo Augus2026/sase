@@ -1,5 +1,5 @@
 use crate::codec::{Data, Handshake, KeepAlive, Message, MessageType};
-use crate::common::{tun_io_task, ClientConfig};
+use crate::common::{load_routing_engine, tun_io_task, ClientConfig};
 use crate::transport::{TcpTransport, TransportTrait, UdpTransport, WsTransport};
 use crate::tun_config::{create_tun_device, TunConfig};
 use anyhow::Result;
@@ -166,8 +166,15 @@ pub async fn run_tcp_client(
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "client")?;
 
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "client",
+    ));
     let transport_handle = tokio::spawn(transport_io_task(
         transport,
         server_addr,
@@ -211,8 +218,15 @@ pub async fn run_udp_client(
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let server_addr = config.server_addr.parse::<std::net::SocketAddr>()?;
+    let routing_engine = load_routing_engine(config.rules_path.as_deref(), "client")?;
 
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "client",
+    ));
     let transport_handle = tokio::spawn(transport_io_task(
         transport,
         server_addr,
@@ -256,8 +270,15 @@ pub async fn run_ws_client(
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let server_addr = transport.server_addr();
+    let routing_engine = load_routing_engine(_config.rules_path.as_deref(), "client")?;
 
-    let tun_handle = tokio::spawn(tun_io_task(tun, tun_tx, transport_rx));
+    let tun_handle = tokio::spawn(tun_io_task(
+        tun,
+        tun_tx,
+        transport_rx,
+        routing_engine,
+        "client",
+    ));
     let transport_handle = tokio::spawn(transport_io_task(
         transport,
         server_addr,

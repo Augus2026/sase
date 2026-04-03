@@ -1,4 +1,6 @@
 use std::{net::Ipv4Addr, path::Path};
+use log::{debug, info};
+use sase_routing::{HotReloadableEngine, PacketContext, RoutingAction};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const SERVER_ADDR: &str = "127.0.0.1";
@@ -115,10 +117,76 @@ impl ServerConfig {
     }
 }
 
+pub fn load_routing_engine(
+    rules_path: Option<&str>,
+    component: &str,
+) -> anyhow::Result<Option<HotReloadableEngine>> {
+    let Some(rules_path) = rules_path else {
+        return Ok(None);
+    };
+
+    let engine = HotReloadableEngine::from_file(Path::new(rules_path))
+        .map_err(|e| anyhow::anyhow!("Failed to load routing rules for {}: {}", component, e))?;
+
+    info!(
+        "{} routing enabled with {} rules from {}",
+        component,
+        engine.rule_count(),
+        rules_path
+    );
+
+    Ok(Some(engine))
+}
+
+fn should_forward_to_tunnel(
+    packet: &[u8],
+    routing_engine: Option<&HotReloadableEngine>,
+    component: &str,
+) -> bool {
+    let Some(engine) = routing_engine else {
+        return true;
+    };
+
+    let Some(packet_ctx) = PacketContext::from_ip_packet(packet) else {
+        debug!(
+            "{} could not parse packet for routing, forwarding through tunnel",
+            component
+        );
+        return true;
+    };
+
+    let decision = engine.match_packet(&packet_ctx);
+    match decision.action {
+        RoutingAction::Proxy => {
+            info!(
+                "{} forwarded packet {} to tunnel via proxy rule {:?}",
+                component, packet_ctx, decision.rule_name
+            );
+            true
+        }
+        RoutingAction::Drop => {
+            info!(
+                "{} dropped packet {} by rule {:?}",
+                component, packet_ctx, decision.rule_name
+            );
+            false
+        }
+        RoutingAction::Direct => {
+            info!(
+                "{} matched direct route for packet {} by rule {:?}; direct forwarding is not implemented, so the packet will not enter the tunnel",
+                component, packet_ctx, decision.rule_name
+            );
+            false
+        }
+    }
+}
+
 pub async fn tun_io_task(
     mut tun: tun2::AsyncDevice,
     tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut transport_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    routing_engine: Option<HotReloadableEngine>,
+    component: &'static str,
 ) -> anyhow::Result<()> {
     let mut tun_buf = vec![0u8; TUN_MTU];
     loop {
@@ -140,6 +208,9 @@ pub async fn tun_io_task(
                 match result {
                     Ok(n) => {
                         let data = tun_buf[..n].to_vec();
+                        if !should_forward_to_tunnel(&data, routing_engine.as_ref(), component) {
+                            continue;
+                        }
                         if let Err(e) = tun_tx.send(data).await {
                             return Err(anyhow::anyhow!("Failed to send to transport: {}", e));
                         }

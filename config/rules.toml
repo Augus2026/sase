@@ -1,45 +1,19 @@
-# 数据包分流规则配置文件
-# Packet Routing Rules Configuration
-
-# 默认路由动作 (无规则匹配时)
-# Default routing action when no rule matches
-default_action = "direct"  # direct | intranet | proxy | drop
-
-# 规则列表 (按优先级排序，优先级高的在前)
-# Rules are processed in priority order (higher priority first)
+default_action = "direct"
 
 [[rules]]
-name = "阻断恶意IP"
+name = "direct rule"
 priority = 200
-match_cond = { dst_ip = "1.2.3.4/32" }
-action = "drop"
+match_cond = { dst_ip = "1.1.1.1/32" }
+action = "direct"
 
 [[rules]]
-name = "内网流量-10段"
+name = "proxy rule"
 priority = 100
 match_cond = { dst_ip = "10.0.0.0/8" }
-action = "intranet"
-
-[[rules]]
-name = "内网流量-172段"
-priority = 100
-match_cond = { dst_ip = "172.16.0.0/12" }
-action = "intranet"
-
-[[rules]]
-name = "内网流量-192段"
-priority = 100
-match_cond = { dst_ip = "192.168.0.0/16" }
-action = "intranet"
-
-[[rules]]
-name = "HTTPS代理"
-priority = 50
-match_cond = { dst_port = "443" }
 action = "proxy"
 
 [[rules]]
-name = "SSH阻断"
+name = "drop rule"
 priority = 150
 match_cond = { dst_port = "22", protocol = "tcp" }
 action = "drop"
