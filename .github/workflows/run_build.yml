@@ -1,0 +1,68 @@
+name: sase build (Ubuntu Only)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build sase (linux-x64)
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --release --all-features
+
+      - name: Package and export
+        shell: bash
+        run: |
+          BINARY_NAME="sase"
+          EXPECTED_PATH="target/release/$BINARY_NAME"
+          STAGING_DIR="staging_linux_x64"
+          
+          mkdir -p "$STAGING_DIR"
+          cp "$EXPECTED_PATH" "$STAGING_DIR/"
+          chmod +x "$STAGING_DIR/$BINARY_NAME"
+          
+          PACKAGE_NAME="sase-linux-x64.tar.gz"
+          tar czvf "$PACKAGE_NAME" -C "$STAGING_DIR" .
+          
+          echo "PACKAGE_PATH=$PACKAGE_NAME" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sase-linux-x64
+          path: ${{ env.PACKAGE_PATH }}
+
+      - name: Create/Update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.PACKAGE_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
