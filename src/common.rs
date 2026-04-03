@@ -138,7 +138,7 @@ pub fn load_routing_engine(
     Ok(Some(engine))
 }
 
-fn should_forward_to_tunnel(
+fn route_packet(
     packet: &[u8],
     routing_engine: Option<&HotReloadableEngine>,
     component: &str,
@@ -157,6 +157,13 @@ fn should_forward_to_tunnel(
 
     let decision = engine.match_packet(&packet_ctx);
     match decision.action {
+        RoutingAction::Direct => {
+            info!(
+                "{} matched direct route for packet {} by rule {:?}; direct forwarding is not implemented, so the packet will not enter the tunnel",
+                component, packet_ctx, decision.rule_name
+            );
+            false
+        }
         RoutingAction::Proxy => {
             info!(
                 "{} forwarded packet {} to tunnel via proxy rule {:?}",
@@ -167,13 +174,6 @@ fn should_forward_to_tunnel(
         RoutingAction::Drop => {
             info!(
                 "{} dropped packet {} by rule {:?}",
-                component, packet_ctx, decision.rule_name
-            );
-            false
-        }
-        RoutingAction::Direct => {
-            info!(
-                "{} matched direct route for packet {} by rule {:?}; direct forwarding is not implemented, so the packet will not enter the tunnel",
                 component, packet_ctx, decision.rule_name
             );
             false
@@ -208,7 +208,7 @@ pub async fn tun_io_task(
                 match result {
                     Ok(n) => {
                         let data = tun_buf[..n].to_vec();
-                        if !should_forward_to_tunnel(&data, routing_engine.as_ref(), component) {
+                        if !route_packet(&data, routing_engine.as_ref(), component) {
                             continue;
                         }
                         if let Err(e) = tun_tx.send(data).await {
